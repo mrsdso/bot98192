@@ -1,19 +1,12 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Telegram бот для автопланирования и публикации сообщений в группах
-"""
-
 import json
-import nest_asyncio
 import logging
 import asyncio
 import re
 import uuid
+import os
 from datetime import datetime, timedelta, time, date
 from typing import Dict, List, Optional, Any, Tuple
 import pytz
-
 import gspread
 from google.oauth2.service_account import Credentials
 from oauth2client.service_account import ServiceAccountCredentials
@@ -21,6 +14,7 @@ from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup, 
     ReplyKeyboardMarkup, ReplyKeyboardRemove, BotCommand
 )
+from telegram.constants import ChatMemberStatus, ChatType
 from telegram.ext import (
     Application, ContextTypes, ConversationHandler, CommandHandler,
     MessageHandler, CallbackQueryHandler, JobQueue, filters
@@ -36,10 +30,10 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Константы для состояний диалога
-(MAIN_MENU, SELECT_GROUP, ENTER_NAME, SELECT_PERIOD, ENTER_PERIOD_VALUE,
+(MAIN_MENU, SELECT_CHAT, SELECT_TOPIC, ENTER_TOPIC_ID, ENTER_NAME, SELECT_PERIOD, ENTER_PERIOD_VALUE,
  SELECT_WEEKDAYS, ENTER_START_DATE, ENTER_END_DATE, ENTER_TIME, 
  ENTER_TEXT, CONFIRM_EVENT, VIEW_EVENTS, EDIT_EVENT, DELETE_EVENT,
- EDIT_FIELD) = range(15)
+ EDIT_FIELD) = range(17)
 
 # Константы для типов периодичности
 PERIOD_TYPES = {
@@ -63,60 +57,676 @@ WEEKDAYS = {
 }
 
 class TelegramBot:
+    def _get_period_display_ru(self, period_type, period_value=None):
+        mapping = {
+            'daily': 'Ежедневно',
+            'weekly': 'Еженедельно',
+            'monthly': 'Ежемесячно',
+            'once': 'Однократно',
+            'custom_days': lambda v: f'Каждые {v} дней',
+            'weekdays': lambda v: 'По дням недели: ' + ', '.join([WEEKDAYS[d].replace('📅 ','') for d in v]) if v else 'По дням недели',
+        }
+        if period_type == 'custom_days' and period_value:
+            return mapping['custom_days'](period_value)
+        if period_type == 'weekdays' and period_value:
+            return mapping['weekdays'](period_value)
+        return mapping.get(period_type, period_type)
+
+    def _get_status_display_ru(self, status):
+        if status == 'active':
+            return 'активно'
+        if status == 'inactive':
+            return 'неактивно'
+        if status == 'complete':
+            return 'выполнено'
+        if status == 'error':
+            return 'ошибка'
+        if status == 'Closed':
+            return 'неактивно'
+        if status == 'Open':
+            return 'активно'
+        return str(status)
     async def back_to_main_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Возврат в главное меню"""
-        keyboard = [
-            ['📝 Создать событие', '📋 Просмотр событий'],
-            ['ℹ️ Помощь']
-        ]
-        reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+        # Убираем кнопки управления ботом внутри групп
+        if update.effective_chat.type in [ChatType.GROUP, ChatType.SUPERGROUP]:
+            reply_markup = ReplyKeyboardRemove()
+        else:
+            keyboard = [
+                ['📝 Создать событие', '📋 Просмотр событий'],
+                ['ℹ️ Помощь']
+            ]
+            reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
         await update.message.reply_text(
             "🏠 Главное меню",
             reply_markup=reply_markup
         )
         return MAIN_MENU
-    async def _get_user_admin_groups(self, user_id: int, bot) -> dict:
+    async def _get_available_chats(self, user_id: int, bot) -> dict:
         """
-        Возвращает словарь {group_id: group_name} для групп, где пользователь является администратором.
+        Возвращает словарь {chat_id: chat_name} для чатов, где пользователь является администратором.
         """
-        admin_groups = {}
-        for group_id, group_info in self.known_groups.items():
+        available_chats = {}
+        all_chats = self._get_all_chats_from_sheets()
+        
+        for chat_id in all_chats:
             try:
-                chat_member = await bot.get_chat_member(chat_id=int(group_id), user_id=user_id)
+                chat_member = await bot.get_chat_member(chat_id=chat_id, user_id=user_id)
                 if chat_member.status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER):
-                    # Извлекаем название группы из структуры данных
-                    if isinstance(group_info, dict) and 'title' in group_info:
-                        group_name = group_info['title']
-                    elif isinstance(group_info, str):
-                        group_name = group_info
-                    else:
-                        group_name = f"Группа {group_id}"
-                    admin_groups[group_id] = group_name
+                    chat_name = self._get_chat_name_by_id(chat_id)
+                    available_chats[str(chat_id)] = chat_name
             except Exception as e:
-                logger.warning(f"Не удалось проверить права пользователя {user_id} в группе {group_id}: {e}")
-        return admin_groups
+                logger.warning(f"Не удалось проверить права пользователя {user_id} в чате {chat_id}: {e}")
+        return available_chats
+    
+    async def _get_forum_topics(self, bot, chat_id: int) -> dict:
+        """
+        Получает список реальных топиков форума для супергруппы из Google Sheets.
+        Возвращает словарь {topic_id: topic_name} или {None: "Общий чат"} для обычных групп.
+        """
+        try:
+            # Проверяем, является ли чат супергруппой с форумом
+            chat = await bot.get_chat(chat_id)
+            
+            if hasattr(chat, 'is_forum') and chat.is_forum:
+                # Для форумов получаем топики из Google Sheets (включая закрытые для отображения)
+                topics = self._get_chat_topics_from_sheets(chat_id, include_closed=True)
+                
+                # Всегда добавляем только общий чат
+                result = {
+                    None: "💬 Общий чат (без топика)"
+                }
+                
+                # Добавляем сохраненные топики
+                for topic_id, topic_name in topics.items():
+                    result[topic_id] = f"📌 {topic_name}"
+                
+                logger.info(f"Найдено {len(topics)} топиков в форуме {chat_id}")
+                return result
+            else:
+                # Для обычных групп возвращаем только общий чат
+                return {None: "💬 Общий чат"}
+                
+        except Exception as e:
+            logger.warning(f"Ошибка при получении информации о топиках чата {chat_id}: {e}")
+            return {None: "💬 Общий чат"}
+    
+    def _get_chat_name_by_id(self, chat_id: int) -> str:
+        """Получает название чата по его ID из Google Sheets"""
+        try:
+            if not hasattr(self, 'topics_worksheet') or self.topics_worksheet is None:
+                return str(chat_id)
+                
+            # Получаем все записи из Google Sheets
+            all_data = self.topics_worksheet.get_all_records()
+            
+            for row in all_data:
+                if str(row.get('ChatID')) == str(chat_id):
+                    return row.get('ChatName', str(chat_id))
+            
+            # Если не найдено, возвращаем ID как строку
+            return str(chat_id)
+        except Exception as e:
+            logger.error(f"Ошибка получения названия чата {chat_id}: {e}")
+            return str(chat_id)
+
+    def _save_chat_to_sheets(self, chat_id: int, chat_name: str, chat_type: str):
+        """Сохраняет информацию о чате в Google Sheets"""
+        try:
+            if not hasattr(self, 'topics_worksheet') or self.topics_worksheet is None:
+                logger.error("❌ Topics worksheet не инициализирован")
+                return
+                
+            # Проверяем, есть ли уже запись о чате
+            all_data = self.topics_worksheet.get_all_records()
+            chat_exists = False
+            
+            for row_index, row in enumerate(all_data, start=2):  # +2 из-за заголовка
+                if str(row.get('ChatID')) == str(chat_id):
+                    # Обновляем существующую запись
+                    if row.get('ChatName') != chat_name:
+                        self.topics_worksheet.update_cell(row_index, 2, chat_name)  # ChatName в колонке 2
+                        logger.info(f"📝 Обновлено название чата {chat_id}: {chat_name}")
+                    chat_exists = True
+                    break
+            
+            if not chat_exists:
+                # Добавляем новую запись о чате (без топика)
+                row_data = [str(chat_id), chat_name, chat_type, "", "", "", datetime.now().isoformat()]
+                self.topics_worksheet.append_row(row_data)
+                logger.info(f"➕ Добавлен новый чат в Google Sheets: {chat_name} (ID: {chat_id})")
+                
+        except Exception as e:
+            logger.error(f"❌ Ошибка сохранения чата в Google Sheets: {e}")
+
+    def _add_topic_to_sheets(self, chat_id: int, topic_id: int, topic_name: str, closed: bool = False):
+        """Добавляет топик в Google Sheets"""
+        try:
+            if not hasattr(self, 'topics_worksheet') or self.topics_worksheet is None:
+                logger.error("❌ Topics worksheet не инициализирован")
+                return
+                
+            chat_name = self._get_chat_name_by_id(chat_id)
+            status = "Closed" if closed else "Open"
+            
+            logger.info(f"📝 Попытка добавить топик: ChatID={chat_id}, ChatName='{chat_name}', TopicName='{topic_name}', TopicID={topic_id}, Status={status}")
+            
+            # Проверяем, существует ли уже топик с таким ChatID и TopicID
+            existing_data = self.topics_worksheet.get_all_records()
+            logger.info(f"📊 Получено {len(existing_data)} записей из Google Sheets")
+            
+            for row_index, row in enumerate(existing_data, start=2):  # +2 из-за заголовка
+                if (str(row.get('ChatID')) == str(chat_id) and 
+                    str(row.get('TopicID')) == str(topic_id)):
+                    logger.info(f"⚠️ Топик с ID {topic_id} уже существует, обновляем вместо добавления")
+                    # Обновляем существующий топик
+                    if row.get('TopicName') != topic_name:
+                        self.topics_worksheet.update_cell(row_index, 4, topic_name)  # TopicName в колонке 4
+                        logger.info(f"📝 Обновлено название топика {topic_id} на '{topic_name}'")
+                    
+                    if row.get('Status') != status:
+                        self.topics_worksheet.update_cell(row_index, 6, status)  # Status в колонке 6
+                        logger.info(f"🔄 Обновлен статус топика {topic_id} на '{status}'")
+                    
+                    return
+            
+            # Получаем тип чата (попробуем найти в существующих записях или установить по умолчанию)
+            chat_type = "SUPERGROUP"
+            for row in existing_data:
+                if str(row.get('ChatID')) == str(chat_id) and row.get('ChatType'):
+                    chat_type = row.get('ChatType')
+                    break
+            
+            # Добавляем новый топик
+            row_data = [str(chat_id), chat_name, chat_type, topic_name, str(topic_id), status, datetime.now().isoformat()]
+            logger.info(f"➕ Добавляем строку в Google Sheets: {row_data}")
+            
+            self.topics_worksheet.append_row(row_data)
+            logger.info(f"✅ Топик успешно добавлен в Google Sheets: {chat_name} -> {topic_name} (ID: {topic_id})")
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка добавления топика в Google Sheets: {e}")
+            logger.exception("Полная трассировка ошибки:")
+
+    def _update_topic_in_sheets(self, chat_id: int, topic_id: int, name: str = None, closed: bool = None):
+        """Обновляет топик в Google Sheets"""
+        try:
+            if not hasattr(self, 'topics_worksheet') or self.topics_worksheet is None:
+                logger.error("Topics worksheet не инициализирован")
+                return
+                
+            # Получаем все данные
+            all_data = self.topics_worksheet.get_all_records()
+            
+            # Ищем строку для обновления
+            for row_index, row in enumerate(all_data, start=2):  # +2 потому что начинаем с 2-й строки (1-я = заголовки)
+                if (str(row.get('ChatID')) == str(chat_id) and 
+                    str(row.get('TopicID')) == str(topic_id)):
+                    
+                    # Обновляем данные
+                    if name is not None:
+                        self.topics_worksheet.update_cell(row_index, 4, name)  # TopicName в колонке 4
+                        logger.info(f"Обновлено название топика {topic_id} на '{name}'")
+                    
+                    if closed is not None:
+                        status = "Closed" if closed else "Open"
+                        self.topics_worksheet.update_cell(row_index, 6, status)  # Status в колонке 6
+                        logger.info(f"Обновлен статус топика {topic_id} на '{status}'")
+                    
+                    return
+            
+            # Если топик не найден, добавляем его
+            if name is not None:
+                self._add_topic_to_sheets(chat_id, topic_id, name, closed or False)
+                
+        except Exception as e:
+            logger.error(f"Ошибка обновления топика в Google Sheets: {e}")
+
+    def _get_chat_topics_from_sheets(self, chat_id: int, include_closed: bool = False) -> Dict[int, str]:
+        """Получает топики чата из Google Sheets"""
+        try:
+            if not hasattr(self, 'topics_worksheet') or self.topics_worksheet is None:
+                logger.error("Topics worksheet не инициализирован")
+                return {}
+                
+            # Получаем все записи
+            all_data = self.topics_worksheet.get_all_records()
+            
+            topics = {}
+            for row in all_data:
+                if (str(row.get('ChatID')) == str(chat_id) and 
+                    row.get('TopicID')):  # Только записи с TopicID (не пустые записи чатов)
+                    
+                    # Фильтруем по статусу только если не включены закрытые
+                    if not include_closed and row.get('Status') != 'Open':
+                        continue
+                        
+                    try:
+                        topic_id = int(row.get('TopicID', 0))
+                        topic_name = row.get('TopicName', '')
+                        topic_status = row.get('Status', 'Open')
+                        
+                        if topic_id and topic_name:
+                            # Добавляем метку для закрытых топиков
+                            display_name = topic_name
+                            if topic_status == 'Closed':
+                                display_name = f"{topic_name} [ЗАКРЫТ]"
+                            topics[topic_id] = display_name
+                    except (ValueError, TypeError):
+                        continue
+            
+            logger.info(f"Получены топики для чата {chat_id}: {topics}")
+            return topics
+            
+        except Exception as e:
+            logger.error(f"Ошибка получения топиков из Google Sheets: {e}")
+            return {}
+    
+    def _check_topic_status(self, chat_id: int, topic_id: int) -> str:
+        """Проверяет статус топика (Open/Closed)"""
+        try:
+            if not hasattr(self, 'topics_worksheet') or self.topics_worksheet is None:
+                return "Open"  # По умолчанию считаем открытым
+                
+            all_data = self.topics_worksheet.get_all_records()
+            
+            for row in all_data:
+                if (str(row.get('ChatID')) == str(chat_id) and 
+                    str(row.get('TopicID')) == str(topic_id)):
+                    return row.get('Status', 'Open')
+            
+            return "Open"  # Если не найден, считаем открытым
+            
+        except Exception as e:
+            logger.error(f"Ошибка проверки статуса топика: {e}")
+            return "Open"
+
+    def _get_all_chats_from_sheets(self) -> Dict[str, dict]:
+        """Получает все чаты из Google Sheets"""
+        try:
+            if not hasattr(self, 'topics_worksheet') or self.topics_worksheet is None:
+                logger.error("Topics worksheet не инициализирован")
+                return {}
+                
+            # Получаем все записи
+            all_data = self.topics_worksheet.get_all_records()
+            
+            chats = {}
+            for row in all_data:
+                chat_id = str(row.get('ChatID'))
+                if chat_id and chat_id not in chats:
+                    chats[chat_id] = {
+                        'title': row.get('ChatName', ''),
+                        'type': row.get('ChatType', 'SUPERGROUP'),
+                        'added_date': row.get('AddedDate', datetime.now().isoformat())
+                    }
+            
+            logger.info(f"Получено {len(chats)} чатов из Google Sheets")
+            return chats
+            
+        except Exception as e:
+            logger.error(f"Ошибка получения чатов из Google Sheets: {e}")
+            return {}
+    
+    def _add_topic_to_chat(self, chat_id: int, topic_id: int, topic_name: str, closed: bool = False):
+        """Добавляет топик в Google Sheets (новая версия)"""
+        logger.info(f"_add_topic_to_chat вызван: chat_id={chat_id}, topic_id={topic_id}, topic_name={topic_name}")
+        self._add_topic_to_sheets(chat_id, topic_id, topic_name, closed)
+        logger.info(f"Добавлен топик {topic_id} '{topic_name}' в чат {chat_id}")
+    
+    def _update_topic_in_chat(self, chat_id: int, topic_id: int, name: str = None, closed: bool = None):
+        """Обновляет данные топика в Google Sheets (новая версия)"""
+        self._update_topic_in_sheets(chat_id, topic_id, name, closed)
+        logger.info(f"Обновлен топик {topic_id} в чате {chat_id}")
+    
+    def _remove_topic_from_chat(self, chat_id: int, topic_id: int):
+        """Удаляет топик из данных чата"""
+        chat_data = self._get_chat_data(chat_id)
+    def _remove_topic_from_chat(self, chat_id: int, topic_id: int):
+        """Удаляет топик из Google Sheets (если понадобится в будущем)"""
+        # В текущей реализации топики не удаляются, только обновляется статус
+        logger.info(f"Запрос на удаление топика {topic_id} из чата {chat_id} (пока не реализовано)")
+    
     async def handle_group_message(self, update, context):
         """Обработка сообщений вне сценария ConversationHandler (например, в группах)"""
-        # Автоматически добавляем группу в known_groups если она еще не добавлена
-        if update.effective_chat and update.effective_chat.type in [ChatType.GROUP, ChatType.SUPERGROUP]:
-            chat_id = str(update.effective_chat.id)
-            chat_title = update.effective_chat.title or f"Группа {chat_id}"
-            
-            # Если группа не в списке, добавляем её
-            if chat_id not in self.known_groups:
-                self.known_groups[chat_id] = {
-                    "title": chat_title,
-                    "added_date": datetime.now().isoformat()
-                }
-                self._save_known_groups()
-                logger.info(f"Добавлена новая группа: {chat_title} ({chat_id})")
-            
-            # Обновляем название группы если оно изменилось
-            elif isinstance(self.known_groups[chat_id], dict) and self.known_groups[chat_id].get('title') != chat_title:
-                self.known_groups[chat_id]['title'] = chat_title
-                self._save_known_groups()
-                logger.info(f"Обновлено название группы: {chat_title} ({chat_id})")
+        # Логируем все важные поля update для отладки
+        if update.message:
+            logger.info(f"🔍 ПОЛУЧЕНО СООБЩЕНИЕ:")
+            logger.info(f"    Chat ID: {update.effective_chat.id}")
+            logger.info(f"    Chat Type: {update.effective_chat.type}")
+            logger.info(f"    Message Thread ID: {getattr(update.message, 'message_thread_id', 'None')}")
+            logger.info(f"    Text: {getattr(update.message, 'text', 'None')}")
+            logger.info(f"    Forum Topic Created: {getattr(update.message, 'forum_topic_created', 'None')}")
+            logger.info(f"    Forum Topic Edited: {getattr(update.message, 'forum_topic_edited', 'None')}")
+            logger.info(f"    Forum Topic Closed: {getattr(update.message, 'forum_topic_closed', 'None')}")
+            logger.info(f"    Forum Topic Reopened: {getattr(update.message, 'forum_topic_reopened', 'None')}")
         
+        # Проверяем события топиков и обрабатываем их напрямую
+        if update.message:
+            # Создание топика
+            if update.message.forum_topic_created:
+                logger.info("🎯 ОБНАРУЖЕНО СОБЫТИЕ СОЗДАНИЯ ТОПИКА - вызываем обработчик")
+                await self.handle_forum_topic_created(update, context)
+                return
+            
+            # Редактирование топика
+            if update.message.forum_topic_edited:
+                logger.info("🎯 ОБНАРУЖЕНО СОБЫТИЕ РЕДАКТИРОВАНИЯ ТОПИКА - вызываем обработчик")
+                await self.handle_forum_topic_edited(update, context)
+                return
+                
+            # Закрытие топика
+            if update.message.forum_topic_closed:
+                logger.info("🎯 ОБНАРУЖЕНО СОБЫТИЕ ЗАКРЫТИЯ ТОПИКА - вызываем обработчик")
+                await self.handle_forum_topic_closed(update, context)
+                return
+                
+            # Открытие топика
+            if update.message.forum_topic_reopened:
+                logger.info("🎯 ОБНАРУЖЕНО СОБЫТИЕ ОТКРЫТИЯ ТОПИКА - вызываем обработчик")
+                await self.handle_forum_topic_reopened(update, context)
+                return
+                
+            # Проверяем, если это первое сообщение в новом топике (возможное создание топика)
+            message_thread_id = getattr(update.message, 'message_thread_id', None)
+            if message_thread_id and update.effective_chat.type.name == 'SUPERGROUP':
+                chat_id = update.effective_chat.id
+                
+                # Проверяем, есть ли уже этот топик в Google Sheets
+                topics = self._get_chat_topics_from_sheets(chat_id)
+                if message_thread_id not in topics:
+                    logger.info(f"🆕 ОБНАРУЖЕН НОВЫЙ ТОПИК: ID {message_thread_id} - возможно создание топика")
+                    
+                    # Получаем название топика через API (если возможно)
+                    try:
+                        # Пытаемся получить информацию о топике
+                        # Для этого можем попробовать использовать текст первого сообщения как название
+                        text = getattr(update.message, 'text', None)
+                        topic_name = text if text and len(text) < 100 else f"Topic_{message_thread_id}"
+                        
+                        # Добавляем топик
+                        self._add_topic_to_chat(chat_id, message_thread_id, topic_name)
+                        logger.info(f"✅ ДОБАВЛЕН НОВЫЙ ТОПИК: {message_thread_id} '{topic_name}' в чат {chat_id}")
+                    except Exception as e:
+                        logger.error(f"❌ Ошибка при добавлении нового топика: {e}")
+        
+        # Автоматически сохраняем чат в Google Sheets при получении сообщений
+        if update.effective_chat and update.effective_chat.type in [ChatType.GROUP, ChatType.SUPERGROUP, ChatType.CHANNEL]:
+            chat_id = update.effective_chat.id
+            chat_title = update.effective_chat.title or f"Чат {chat_id}"
+            chat_type = update.effective_chat.type.name
+            
+            # Сохраняем информацию о чате в Google Sheets
+            await self._save_chat_name_to_sheets(chat_id, chat_title, chat_type)
+            logger.info(f"Обработано сообщение из чата: {chat_title} ({chat_id})")
+    async def handle_forum_topic_created(self, update, context):
+        """Обработка создания нового топика в форуме"""
+        logger.info(f"🔄 handle_forum_topic_created вызван")
+        logger.info(f"📋 Update object: {update}")
+        logger.info(f"📋 Update.message: {update.message if update.message else 'None'}")
+        if update.message:
+            logger.info(f"📋 forum_topic_created: {getattr(update.message, 'forum_topic_created', 'None')}")
+            logger.info(f"📋 message_thread_id: {getattr(update.message, 'message_thread_id', 'None')}")
+        
+        try:
+            if update.message and update.message.forum_topic_created:
+                chat_id = update.effective_chat.id
+                chat_title = update.effective_chat.title or f"Чат {chat_id}"
+                message_thread_id = update.message.message_thread_id
+                topic_name = update.message.forum_topic_created.name
+                
+                logger.info(f"📝 СОЗДАНИЕ ТОПИКА: '{topic_name}' (ID: {message_thread_id}) в чате '{chat_title}' ({chat_id})")
+                
+                # Сохраняем название чата перед добавлением топика
+                await self._save_chat_name_to_sheets(chat_id, chat_title, update.effective_chat.type.name)
+                
+                # Добавляем топик в Google Sheets
+                self._add_topic_to_chat(chat_id, message_thread_id, topic_name)
+                
+                logger.info(f"✅ ТОПИК СОХРАНЕН: '{topic_name}' (ID: {message_thread_id}) успешно добавлен в Google Sheets")
+            else:
+                logger.warning(f"❌ Событие создания топика получено, но данные некорректны")
+                logger.warning(f"❌ Update: {update}")
+                if update.message:
+                    logger.warning(f"❌ Message: {update.message}")
+                    logger.warning(f"❌ forum_topic_created: {getattr(update.message, 'forum_topic_created', 'None')}")
+                        
+        except Exception as e:
+            logger.error(f"❌ Ошибка при обработке создания топика: {e}")
+            logger.exception("Полная трассировка ошибки:")
+    
+    async def handle_forum_topic_edited(self, update, context):
+        """Обработка редактирования топика в форуме"""
+        logger.info(f"🔄 handle_forum_topic_edited вызван")
+        logger.info(f"📋 Update object: {update}")
+        logger.info(f"📋 Update.message: {update.message if update.message else 'None'}")
+        if update.message:
+            logger.info(f"📋 forum_topic_edited: {getattr(update.message, 'forum_topic_edited', 'None')}")
+            logger.info(f"📋 message_thread_id: {getattr(update.message, 'message_thread_id', 'None')}")
+        
+        try:
+            if update.message and update.message.forum_topic_edited:
+                chat_id = update.effective_chat.id
+                chat_title = update.effective_chat.title or f"Чат {chat_id}"
+                message_thread_id = update.message.message_thread_id
+                
+                logger.info(f"🔄 РЕДАКТИРОВАНИЕ ТОПИКА: ID {message_thread_id} в чате '{chat_title}' ({chat_id})")
+                
+                # Сохраняем название чата перед обновлением топика
+                await self._save_chat_name_to_sheets(chat_id, chat_title, update.effective_chat.type.name)
+                
+                edited_data = update.message.forum_topic_edited
+                new_name = edited_data.name if edited_data.name else None
+                
+                if new_name:
+                    logger.info(f"📝 НОВОЕ НАЗВАНИЕ ТОПИКА: '{new_name}'")
+                    
+                    # Проверяем, есть ли топик в Google Sheets
+                    topics = self._get_chat_topics_from_sheets(chat_id)
+                    logger.info(f"📊 Найдено топиков в Google Sheets для чата {chat_id}: {len(topics)}")
+                    
+                    if message_thread_id in topics:
+                        # Обновляем существующий топик
+                        logger.info(f"🔄 ОБНОВЛЯЕМ СУЩЕСТВУЮЩИЙ ТОПИК {message_thread_id}")
+                        self._update_topic_in_chat(chat_id, message_thread_id, name=new_name)
+                        logger.info(f"✅ ОБНОВЛЕНО название топика {message_thread_id} на '{new_name}' в чате {chat_id}")
+                    else:
+                        # Добавляем новый топик
+                        logger.info(f"➕ ДОБАВЛЯЕМ НОВЫЙ ТОПИК {message_thread_id}")
+                        self._add_topic_to_chat(chat_id, message_thread_id, new_name)
+                        logger.info(f"✅ ДОБАВЛЕН новый топик {message_thread_id} '{new_name}' в чат {chat_id}")
+                else:
+                    logger.warning(f"⚠️ Название топика не изменилось или пустое")
+                    # Даже если названия нет, попробуем сохранить топик по ID
+                    topics = self._get_chat_topics_from_sheets(chat_id)
+                    if message_thread_id not in topics:
+                        logger.info(f"➕ ДОБАВЛЯЕМ ТОПИК БЕЗ НАЗВАНИЯ: ID {message_thread_id}")
+                        self._add_topic_to_chat(chat_id, message_thread_id, f"Topic_{message_thread_id}")
+                    
+            else:
+                logger.warning(f"❌ Событие редактирования топика получено, но данные некорректны")
+                logger.warning(f"❌ Update: {update}")
+                if update.message:
+                    logger.warning(f"❌ Message: {update.message}")
+                    logger.warning(f"❌ forum_topic_edited: {getattr(update.message, 'forum_topic_edited', 'None')}")
+                        
+        except Exception as e:
+            logger.error(f"❌ Ошибка при обработке редактирования топика: {e}")
+            logger.exception("Полная трассировка ошибки:")
+            logger.error(f"❌ Ошибка при обработке редактирования топика: {e}")
+            logger.exception("Полная трассировка ошибки:")
+
+    async def _save_chat_name_to_sheets(self, chat_id: int, chat_title: str, chat_type: str = "SUPERGROUP"):
+        """Сохраняет соответствие ID чата и его названия в Google Sheets"""
+        try:
+            self._save_chat_to_sheets(chat_id, chat_title, chat_type)
+            logger.info(f"Сохранено название чата: {chat_title} (ID: {chat_id})")
+        except Exception as e:
+            logger.error(f"Ошибка сохранения названия чата: {e}")
+
+    async def init_topics_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Команда для инициализации топиков форума в Google Sheets"""
+        try:
+            chat = update.effective_chat
+            if chat.type not in [ChatType.GROUP, ChatType.SUPERGROUP]:
+                await update.message.reply_text(
+                    "❌ Эта команда работает только в группах и супергруппах."
+                )
+                return
+            
+            # Проверяем права администратора
+            user_member = await context.bot.get_chat_member(chat.id, update.effective_user.id)
+            if user_member.status not in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER]:
+                await update.message.reply_text(
+                    "❌ Только администраторы могут использовать эту команду."
+                )
+                return
+            
+            chat_info = await context.bot.get_chat(chat.id)
+            if not (hasattr(chat_info, 'is_forum') and chat_info.is_forum):
+                await update.message.reply_text(
+                    "❌ Эта команда работает только в форумах. Включите режим тем в настройках группы."
+                )
+                return
+            
+            # Сохраняем информацию о чате в Google Sheets
+            await self._save_chat_name_to_sheets(chat.id, chat.title, chat.type.name)
+            
+            await update.message.reply_text(
+                "🔄 **Инициализация топиков**\n\n"
+                "Чат добавлен в Google Таблицу!\n\n"
+                "📌 **Как работает автоматическое отслеживание:**\n"
+                "• При создании нового топика - автоматически сохраняется\n"
+                "• При изменении названия топика - автоматически обновляется\n"
+                "• При закрытии/открытии топика - обновляется статус\n\n"
+                "🔍 **Для инициализации существующих топиков:**\n"
+                "1. Откройте любой существующий топик\n"
+                "2. Отредактируйте название (добавьте пробел и уберите)\n"
+                "3. Топик будет автоматически добавлен в таблицу\n\n"
+                "📊 Проверьте Google Таблицу - информация о чате уже сохранена!"
+            )
+            
+            # Показываем текущее состояние из Google Sheets
+            topics = self._get_chat_topics_from_sheets(chat.id)
+            
+            if topics:
+                topic_list = []
+                for topic_id, topic_name in topics.items():
+                    topic_list.append(f"• {topic_name} (ID: {topic_id})")
+                
+                result_text = f"\n\n📊 **Уже сохраненные топики ({len(topics)}):**\n\n" + "\n".join(topic_list[:10])
+                if len(topics) > 10:
+                    result_text += f"\n... и ещё {len(topics) - 10} топиков"
+                await update.message.reply_text(result_text)
+            
+        except Exception as e:
+            logger.error(f"Ошибка при инициализации топиков: {e}")
+            await update.message.reply_text(f"❌ Ошибка при инициализации топиков: {str(e)}")
+    
+    async def handle_forum_topic_closed(self, update, context):
+        """Обработка закрытия топика в форуме"""
+        logger.info(f"🔄 handle_forum_topic_closed вызван")
+        logger.info(f"📋 Update object: {update}")
+        logger.info(f"📋 Update.message: {update.message if update.message else 'None'}")
+        if update.message:
+            logger.info(f"📋 forum_topic_closed: {getattr(update.message, 'forum_topic_closed', 'None')}")
+            logger.info(f"📋 message_thread_id: {getattr(update.message, 'message_thread_id', 'None')}")
+            logger.info(f"📋 reply_to_message: {getattr(update.message, 'reply_to_message', 'None')}")
+        
+        try:
+            if update.message and update.message.forum_topic_closed:
+                chat_id = update.effective_chat.id
+                chat_title = update.effective_chat.title or f"Чат {chat_id}"
+                message_thread_id = update.message.message_thread_id
+                
+                logger.info(f"🔒 ЗАКРЫТИЕ ТОПИКА: ID {message_thread_id} в чате '{chat_title}' ({chat_id})")
+                
+                # Пытаемся извлечь название топика из reply_to_message
+                topic_name = f"Topic_{message_thread_id}"  # По умолчанию
+                if (update.message.reply_to_message and 
+                    hasattr(update.message.reply_to_message, 'forum_topic_created') and
+                    update.message.reply_to_message.forum_topic_created):
+                    topic_name = update.message.reply_to_message.forum_topic_created.name
+                    logger.info(f"📝 ИЗВЛЕЧЕНО НАЗВАНИЕ ИЗ REPLY_TO_MESSAGE: '{topic_name}'")
+                
+                # Сохраняем название чата
+                await self._save_chat_name_to_sheets(chat_id, chat_title, update.effective_chat.type.name)
+                
+                # Проверяем, есть ли топик в Google Sheets (включая закрытые)
+                topics = self._get_chat_topics_from_sheets(chat_id, include_closed=True)
+                if message_thread_id in topics:
+                    # Обновляем статус существующего топика
+                    self._update_topic_in_chat(chat_id, message_thread_id, name=topic_name, closed=True)
+                    logger.info(f"✅ ОБНОВЛЕН И ЗАКРЫТ топик {message_thread_id} '{topic_name}' в чате {chat_id}")
+                else:
+                    # Добавляем топик с закрытым статусом и правильным названием
+                    self._add_topic_to_chat(chat_id, message_thread_id, topic_name, closed=True)
+                    logger.info(f"✅ ДОБАВЛЕН И ЗАКРЫТ топик {message_thread_id} '{topic_name}' в чате {chat_id}")
+            else:
+                logger.warning(f"❌ Событие закрытия топика получено, но данные некорректны")
+                
+        except Exception as e:
+            logger.error(f"❌ Ошибка при обработке закрытия топика: {e}")
+            logger.exception("Полная трассировка ошибки:")
+    
+    async def handle_forum_topic_reopened(self, update, context):
+        """Обработка повторного открытия топика в форуме"""
+        logger.info(f"🔄 handle_forum_topic_reopened вызван")
+        logger.info(f"📋 Update object: {update}")
+        logger.info(f"📋 Update.message: {update.message if update.message else 'None'}")
+        if update.message:
+            logger.info(f"📋 forum_topic_reopened: {getattr(update.message, 'forum_topic_reopened', 'None')}")
+            logger.info(f"📋 message_thread_id: {getattr(update.message, 'message_thread_id', 'None')}")
+            logger.info(f"📋 reply_to_message: {getattr(update.message, 'reply_to_message', 'None')}")
+        
+        try:
+            if update.message and update.message.forum_topic_reopened:
+                chat_id = update.effective_chat.id
+                chat_title = update.effective_chat.title or f"Чат {chat_id}"
+                message_thread_id = update.message.message_thread_id
+                
+                logger.info(f"🔓 ОТКРЫТИЕ ТОПИКА: ID {message_thread_id} в чате '{chat_title}' ({chat_id})")
+                
+                # Пытаемся извлечь название топика из reply_to_message
+                topic_name = f"Topic_{message_thread_id}"  # По умолчанию
+                if (update.message.reply_to_message and 
+                    hasattr(update.message.reply_to_message, 'forum_topic_created') and
+                    update.message.reply_to_message.forum_topic_created):
+                    topic_name = update.message.reply_to_message.forum_topic_created.name
+                    logger.info(f"📝 ИЗВЛЕЧЕНО НАЗВАНИЕ ИЗ REPLY_TO_MESSAGE: '{topic_name}'")
+                
+                # Сохраняем название чата
+                await self._save_chat_name_to_sheets(chat_id, chat_title, update.effective_chat.type.name)
+                
+                # Проверяем, есть ли топик в Google Sheets (включая закрытые)
+                topics = self._get_chat_topics_from_sheets(chat_id, include_closed=True)
+                if message_thread_id in topics:
+                    # Обновляем статус существующего топика
+                    self._update_topic_in_chat(chat_id, message_thread_id, name=topic_name, closed=False)
+                    logger.info(f"✅ ОБНОВЛЕН И ОТКРЫТ топик {message_thread_id} '{topic_name}' в чате {chat_id}")
+                else:
+                    # Добавляем топик с открытым статусом и правильным названием
+                    self._add_topic_to_chat(chat_id, message_thread_id, topic_name, closed=False)
+                    logger.info(f"✅ ДОБАВЛЕН И ОТКРЫТ топик {message_thread_id} '{topic_name}' в чате {chat_id}")
+            else:
+                logger.warning(f"❌ Событие открытия топика получено, но данные некорректны")
+                
+        except Exception as e:
+            logger.error(f"❌ Ошибка при обработке открытия топика: {e}")
+            logger.exception("Полная трассировка ошибки:")
+    
+    async def handle_general_forum_topic_hidden(self, update, context):
+        """Обработка скрытия общего топика форума"""
+        if update.message and update.message.general_forum_topic_hidden:
+            chat_id = update.effective_chat.id
+            logger.info(f"Скрыт общий топик в чате {chat_id}")
+    
+    async def handle_general_forum_topic_unhidden(self, update, context):
+        """Обработка показа общего топика форума"""
+        if update.message and update.message.general_forum_topic_unhidden:
+            chat_id = update.effective_chat.id
+            logger.info(f"Показан общий топик в чате {chat_id}")
+
         return
     def create_conversation_handler(self):
         """Создаёт ConversationHandler для управления диалогом пользователя"""
@@ -126,7 +736,9 @@ class TelegramBot:
             entry_points=[CommandHandler('start', self.start)],
             states={
                 MAIN_MENU: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.main_menu)],
-                SELECT_GROUP: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.select_group)],
+                SELECT_CHAT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.select_chat)],
+                SELECT_TOPIC: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.select_topic)],
+                ENTER_TOPIC_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.enter_topic_id)],
                 ENTER_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.enter_name)],
                 SELECT_PERIOD: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.select_period)],
                 ENTER_PERIOD_VALUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.enter_period_value)],
@@ -136,7 +748,7 @@ class TelegramBot:
                 ENTER_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.enter_time)],
                 ENTER_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.enter_text)],
                 CONFIRM_EVENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_confirm_event)],
-                VIEW_EVENTS: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.show_group_events)],
+                VIEW_EVENTS: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_view_events)],
                 EDIT_EVENT: [CallbackQueryHandler(self.handle_event_management)],
             },
             fallbacks=[CommandHandler('cancel', self.cancel)],
@@ -146,10 +758,11 @@ class TelegramBot:
     def __init__(self):
         self.token = self._load_token()
         self.service_account = self._load_service_account()
-        self.known_groups = self._load_known_groups()
         self.user_data = {}
         self.sheets_client = None
         self.worksheet = None
+        self.scheduler = None
+        self.application = None
         self.timezone = pytz.timezone('Europe/Moscow')
         self.scope = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
         
@@ -171,20 +784,6 @@ class TelegramBot:
             logger.error("Файл service_account.json не найден")
             raise
             
-    def _load_known_groups(self) -> Dict:
-        """Загрузка известных групп"""
-        try:
-            with open('known_groups.json', 'r', encoding='utf-8') as f:
-                content = f.read().strip()
-                return json.loads(content) if content else {}
-        except (FileNotFoundError, json.JSONDecodeError):
-            return {}
-            
-    def _save_known_groups(self):
-        """Сохранение известных групп"""
-        with open('known_groups.json', 'w', encoding='utf-8') as f:
-            json.dump(self.known_groups, f, ensure_ascii=False, indent=2)
-            
     def _init_google_sheets(self):
         """Инициализация Google Sheets"""
         try:
@@ -198,30 +797,57 @@ class TelegramBot:
             self.worksheet = self.gc.open("BotEvents").sheet1
             logger.info(f"Google Sheet успешно открыт: {self.worksheet.title}")
             
-            # Проверяем заголовки и создаем их при необходимости
+            # Инициализируем worksheet для топиков
+            try:
+                # Находим или создаем worksheet для топиков
+                try:
+                    self.topics_worksheet = self.gc.open("BotEvents").worksheet("Topics")
+                    logger.info("Worksheet 'Topics' найден")
+                except:
+                    # Создаем новый worksheet для топиков
+                    self.topics_worksheet = self.gc.open("BotEvents").add_worksheet(title="Topics", rows="1000", cols="4")
+                    logger.info("Создан новый worksheet 'Topics'")
+                
+                # Проверяем и создаем заголовки для топиков
+                topics_headers = self.topics_worksheet.row_values(1)
+                expected_topics_headers = ['ChatID', 'ChatName', 'ChatType', 'TopicName', 'TopicID', 'Status', 'AddedDate']
+                
+                if not topics_headers or topics_headers != expected_topics_headers:
+                    logger.info("Создание заголовков для топиков в Google Sheets")
+                    self.topics_worksheet.clear()
+                    self.topics_worksheet.append_row(expected_topics_headers)
+                    logger.info("Заголовки для топиков созданы")
+                    
+            except Exception as topics_error:
+                logger.error(f"Ошибка инициализации worksheet для топиков: {topics_error}")
+                self.topics_worksheet = None
+                
+            # Проверяем заголовки основной таблицы и создаем их при необходимости
             try:
                 headers = self.worksheet.row_values(1)
-                expected_headers = ['ID', 'ChatID', 'Description', 'StartDate', 'EndDate', 'Forever', 'Time', 'PeriodType', 'PeriodValue', 'Text', 'Status']
+                # Новая структура согласно требованиям пользователя:
+                # 1. ID события, 2. Идентификатор чата, 3. Название/описание события
+                # 4. Дата начала, 5. Дата окончания, 6. Время публикации
+                # 7. Периодичность, 8. Текст сообщения, 9. Статус
+                expected_headers = ['ID', 'ChatID', 'Description', 'StartDate', 'EndDate', 'Time', 'PeriodType', 'Text', 'Status']
                 
                 if not headers or headers != expected_headers:
                     logger.info("Создание заголовков в Google Sheets")
                     self.worksheet.clear()
                     self.worksheet.append_row(expected_headers)
-                    logger.info("Заголовки созданы")
+                    logger.info("Заголовки созданы с новой структурой")
             except Exception as header_error:
                 logger.warning(f"Ошибка проверки заголовков: {header_error}")
                 
-            # Инициализируем scheduler если его нет
-            if not hasattr(self, 'scheduler'):
-                from apscheduler.schedulers.asyncio import AsyncIOScheduler
-                self.scheduler = AsyncIOScheduler()
-                self.scheduler.start()
-                logger.info("APScheduler инициализирован и запущен")
-            
             logger.info("Google Sheets успешно инициализирован")
+            return True
+            
         except Exception as e:
             logger.error(f"Ошибка инициализации Google Sheets: {e}")
-            raise
+            logger.warning("Бот будет работать в ограниченном режиме без Google Sheets")
+            self.worksheet = None
+            self.topics_worksheet = None
+            return False
             
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Команда /start"""
@@ -245,13 +871,19 @@ class TelegramBot:
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Команда /help"""
         help_text = """
-🤖 **Бот-планировщик публикаций**
+🤖 **Бот-планировщик публикаций с поддержкой топиков**
 
 **Возможности:**
 • 📝 Создание событий публикации с различной периодичностью
+• 🔖 Поддержка топиков (тем) в супергруппах
 • 📋 Просмотр и управление созданными событиями
 • 🔄 Автоматическая публикация по расписанию
 • 👥 Управление доступно только администраторам групп
+
+**Поддержка топиков:**
+• 💬 Публикация в общий чат (без топика)
+• 🔖 Публикация в конкретный топик супергруппы
+• 🔢 Ручное указание ID топика для точного выбора
 
 **Типы периодичности:**
 • Ежедневно
@@ -265,6 +897,10 @@ class TelegramBot:
 /start - Главное меню
 /help - Эта справка
 /cancel - Отмена текущего действия
+
+**Команды для групп (только для администраторов):**
+/start_bot - Запустить бота в группе
+/init_topics - Инициализировать топики форума
 
 Для начала работы добавьте бота в группу и сделайте его администратором с правами на отправку сообщений.
         """
@@ -287,14 +923,83 @@ class TelegramBot:
             reply_markup=reply_markup
         )
         return MAIN_MENU
-        
+    
+
+    async def start_bot_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Команда для запуска бота в группе"""
+        try:
+            chat = update.effective_chat
+            if chat.type not in [ChatType.GROUP, ChatType.SUPERGROUP]:
+                await update.message.reply_text(
+                    "❌ Эта команда работает только в группах и супергруппах."
+                )
+                return
+            
+            # Проверяем права администратора
+            user_member = await context.bot.get_chat_member(chat.id, update.effective_user.id)
+            if user_member.status not in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER]:
+                await update.message.reply_text(
+                    "❌ Только администраторы могут использовать эту команду."
+                )
+                return
+            
+            # Проверяем, является ли чат форумом
+            chat_info = await context.bot.get_chat(chat.id)
+            is_forum = hasattr(chat_info, 'is_forum') and chat_info.is_forum
+            
+            welcome_text = f"🤖 **Бот-планировщик запущен в {chat.title}!**\n\n"
+            
+            if is_forum:
+                welcome_text += (
+                    "📋 **Функции бота:**\n"
+                    "• Планирование автоматических публикаций\n"
+                    "• Поддержка топиков форума\n"
+                    "• Управление расписанием событий\n\n"
+                    "� **Работа с топиками:**\n"
+                    "• Топики автоматически добавляются при создании\n"
+                    "• Используйте /init_topics для инициализации существующих топиков\n\n"
+                )
+            else:
+                welcome_text += (
+                    "📋 **Функции бота:**\n"
+                    "• Планирование автоматических публикаций\n"
+                    "• Управление расписанием событий\n\n"
+                )
+            
+            welcome_text += (
+                "⚙️ **Как использовать:**\n"
+                "1. Напишите боту в личные сообщения /start\n"
+                "2. Создайте события для публикации\n"
+                "3. Бот будет автоматически публиковать по расписанию\n\n"
+                "💡 Управление ботом доступно только администраторам группы."
+            )
+            
+            await update.message.reply_text(welcome_text)
+            
+        except Exception as e:
+            logger.error(f"Ошибка при запуске бота: {e}")
+            await update.message.reply_text(f"❌ Ошибка при запуске бота: {str(e)}")
+    
+    
     async def main_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработка главного меню"""
         text = update.message.text
         
         if text == '📝 Создать событие':
+            if not hasattr(self, 'worksheet') or self.worksheet is None:
+                await update.message.reply_text(
+                    "❌ Google Sheets недоступен. Создание событий временно невозможно.\n"
+                    "Попробуйте позже или обратитесь к администратору."
+                )
+                return MAIN_MENU
             return await self.start_create_event(update, context)
         elif text == '📋 Просмотр событий':
+            if not hasattr(self, 'worksheet') or self.worksheet is None:
+                await update.message.reply_text(
+                    "❌ Google Sheets недоступен. Просмотр событий временно невозможен.\n"
+                    "Попробуйте позже или обратитесь к администратору."
+                )
+                return MAIN_MENU
             return await self.view_events(update, context)
         elif text == 'ℹ️ Помощь':
             await self.help_command(update, context)
@@ -309,76 +1014,277 @@ class TelegramBot:
         """Начало создания события"""
         user_id = update.effective_user.id
         
-        # Получаем группы, где пользователь является администратором
-        admin_groups = await self._get_user_admin_groups(user_id, context.bot)
+        # Получаем чаты, где пользователь является администратором
+        available_chats = await self._get_available_chats(user_id, context.bot)
         
-        if not admin_groups:
-            await update.message.reply_text(
-                "❌ У вас нет групп, где вы являетесь администратором, или бот не добавлен в группы.\n\n"
-                "Добавьте бота в группу и сделайте его администратором с правами на отправку сообщений."
+        if not available_chats:
+            message_text = (
+                "❌ У вас нет чатов, где вы являетесь администратором, или бот не добавлен в чаты.\n\n"
+                "Добавьте бота в чат и сделайте его администратором с правами на отправку сообщений."
             )
+            
+            if update.message:
+                await update.message.reply_text(message_text)
+            elif update.callback_query:
+                await context.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text=message_text
+                )
             return MAIN_MENU
             
         # Сохраняем данные пользователя
         self.user_data[user_id] = {
-            'admin_groups': admin_groups,
-            'step': 'select_group'
+            'available_chats': available_chats,
+            'step': 'select_chat'
         }
         
-        # Создаем клавиатуру с группами
+        # Создаем клавиатуру с чатами
         keyboard = []
-        for group_id, group_name in admin_groups.items():
-            keyboard.append([f"📱 {group_name}"])
+        for chat_id, chat_name in available_chats.items():
+            keyboard.append([f"💬 {chat_name}"])
         keyboard.append(['🔙 Назад'])
         
         reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+        message_text = "💬 Выберите чат для создания события публикации:"
         
-        await update.message.reply_text(
-            "📱 Выберите группу для создания события публикации:",
-            reply_markup=reply_markup
-        )
+        if update.message:
+            await update.message.reply_text(message_text, reply_markup=reply_markup)
+        elif update.callback_query:
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=message_text,
+                reply_markup=reply_markup
+            )
         
-        return SELECT_GROUP
+        return SELECT_CHAT
         
-    async def select_group(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Выбор группы"""
+    async def select_chat(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Выбор чата"""
         user_id = update.effective_user.id
         text = update.message.text
         
         if text == '🔙 Назад':
             return await self.back_to_main_menu(update, context)
             
-        # Найти выбранную группу
+        # Найти выбранный чат
         if user_id not in self.user_data:
             return await self.start_create_event(update, context)
             
-        admin_groups = self.user_data[user_id]['admin_groups']
-        selected_group_id = None
+        available_chats = self.user_data[user_id]['available_chats']
+        selected_chat_id = None
         
-        for group_id, group_name in admin_groups.items():
-            if text == f"📱 {group_name}":
-                selected_group_id = group_id
+        for chat_id, chat_name in available_chats.items():
+            if text == f"💬 {chat_name}":
+                selected_chat_id = chat_id
                 break
                 
-        if not selected_group_id:
+        if not selected_chat_id:
             await update.message.reply_text(
-                "❌ Группа не найдена. Выберите группу из списка."
+                "❌ Чат не найден. Выберите чат из списка."
             )
-            return SELECT_GROUP
+            return SELECT_CHAT
             
-        self.user_data[user_id]['selected_group'] = selected_group_id
-        self.user_data[user_id]['selected_group_name'] = admin_groups[selected_group_id]
+        self.user_data[user_id]['selected_chat'] = selected_chat_id
+        self.user_data[user_id]['selected_chat_name'] = available_chats[selected_chat_id]
+        
+        # Получаем доступные топики для выбранного чата
+        available_topics = await self._get_forum_topics(context.bot, int(selected_chat_id))
+        self.user_data[user_id]['available_topics'] = available_topics
+        
+        # Если в чате есть только общий топик, пропускаем выбор топика
+        if len(available_topics) == 1 and None in available_topics:
+            self.user_data[user_id]['selected_topic'] = None
+            self.user_data[user_id]['selected_topic_name'] = "Общий чат"
+            
+            keyboard = [['🔙 Назад']]
+            reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+            
+            await update.message.reply_text(
+                f"✅ Выбран чат: {available_chats[selected_chat_id]}\n"
+                f"💬 Топик: Общий чат\n\n"
+                "📝 Введите название события:",
+                reply_markup=reply_markup
+            )
+            return ENTER_NAME
+        else:
+            # Показываем выбор топиков
+            keyboard = []
+            for topic_id, topic_name in available_topics.items():
+                keyboard.append([f"🔖 {topic_name}"])
+            keyboard.append(['🔙 Назад'])
+            
+            reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+            
+            await update.message.reply_text(
+                f"✅ Выбран чат: {available_chats[selected_chat_id]}\n\n"
+                "🔖 Выберите топик для публикации:",
+                reply_markup=reply_markup
+            )
+            return SELECT_TOPIC
+        
+    async def select_topic(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Выбор топика"""
+        user_id = update.effective_user.id
+        
+        # Проверяем тип обновления и получаем текст
+        if update.message:
+            text = update.message.text
+        elif update.callback_query:
+            text = update.callback_query.data
+            await update.callback_query.answer()
+        else:
+            # Если нет ни сообщения, ни callback query, возвращаемся к началу
+            keyboard = [
+                ['📝 Создать событие', '📋 Просмотр событий'],
+                ['ℹ️ Помощь']
+            ]
+            reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+            
+            if update.callback_query:
+                await context.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text="🏠 Главное меню",
+                    reply_markup=reply_markup
+                )
+            return MAIN_MENU
+        
+        if text == '🔙 Назад':
+            return await self.start_create_event(update, context)
+            
+        # Найти выбранный топик
+        if user_id not in self.user_data:
+            return await self.start_create_event(update, context)
+            
+        available_topics = self.user_data[user_id]['available_topics']
+        selected_topic_id = None
+        selected_topic_name = None
+        
+        for topic_id, topic_name in available_topics.items():
+            if text == f"🔖 {topic_name}":
+                selected_topic_id = topic_id
+                selected_topic_name = topic_name
+                break
+                
+        if selected_topic_id is None and selected_topic_name is None:
+            await update.message.reply_text(
+                "❌ Топик не найден. Выберите топик из списка."
+            )
+            return SELECT_TOPIC
+        
+        # Если выбран ручной ввод ID топика
+        if selected_topic_id == 'custom':
+            keyboard = [['🔙 Назад']]
+            reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+            
+            await update.message.reply_text(
+                "🔢 Введите ID топика (числовое значение):\n\n"
+                "Чтобы узнать ID топика, перейдите в нужную тему и скопируйте "
+                "числовое значение из URL или используйте специальные боты.",
+                reply_markup=reply_markup
+            )
+            return ENTER_TOPIC_ID
+        
+        # Проверяем, не закрыт ли выбранный топик
+        if selected_topic_id is not None:  # Только для конкретных топиков, не для общего чата
+            chat_id = int(self.user_data[user_id]['selected_chat'])
+            topic_status = self._check_topic_status(chat_id, selected_topic_id)
+            
+            if topic_status == 'Closed':
+                keyboard = []
+                for topic_id, topic_name in available_topics.items():
+                    keyboard.append([f"🔖 {topic_name}"])
+                keyboard.append(['🔙 Назад'])
+                
+                reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+                
+                await update.message.reply_text(
+                    f"❌ **Топик закрыт!**\n\n"
+                    f"Топик '{selected_topic_name.replace('📌 ', '').replace(' [ЗАКРЫТ]', '')}' "
+                    f"в настоящее время закрыт. Невозможно создать автопубликацию в закрытый топик.\n\n"
+                    f"Пожалуйста, выберите другой топик или дождитесь открытия этого топика.",
+                    reply_markup=reply_markup,
+                    parse_mode='Markdown'
+                )
+                return SELECT_TOPIC
+            
+        self.user_data[user_id]['selected_topic'] = selected_topic_id
+        self.user_data[user_id]['selected_topic_name'] = selected_topic_name
         
         keyboard = [['🔙 Назад']]
         reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
         
+        chat_name = self.user_data[user_id]['selected_chat_name']
         await update.message.reply_text(
-            f"✅ Выбрана группа: {admin_groups[selected_group_id]}\n\n"
+            f"✅ Выбран чат: {chat_name}\n"
+            f"🔖 Топик: {selected_topic_name}\n\n"
             "📝 Введите название события:",
             reply_markup=reply_markup
         )
         
         return ENTER_NAME
+        
+    async def enter_topic_id(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Ввод ID топика вручную"""
+        user_id = update.effective_user.id
+        text = update.message.text
+        
+        if text == '🔙 Назад':
+            # Возвращаемся к выбору топика
+            available_topics = self.user_data[user_id]['available_topics']
+            keyboard = []
+            for topic_id, topic_name in available_topics.items():
+                keyboard.append([f"🔖 {topic_name}"])
+            keyboard.append(['🔙 Назад'])
+            
+            reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+            
+            chat_name = self.user_data[user_id]['selected_chat_name']
+            await update.message.reply_text(
+                f"✅ Выбран чат: {chat_name}\n\n"
+                "🔖 Выберите топик для публикации:",
+                reply_markup=reply_markup
+            )
+            return SELECT_TOPIC
+            
+        try:
+            topic_id = int(text)
+            
+            # Проверяем статус топика
+            chat_id = int(self.user_data[user_id]['selected_chat'])
+            topic_status = self._check_topic_status(chat_id, topic_id)
+            
+            if topic_status == 'Closed':
+                await update.message.reply_text(
+                    f"❌ **Топик закрыт!**\n\n"
+                    f"Топик #{topic_id} в настоящее время закрыт. "
+                    f"Невозможно создать автопубликацию в закрытый топик.\n\n"
+                    f"Пожалуйста, выберите другой топик или дождитесь открытия этого топика.\n\n"
+                    f"🔢 Введите ID другого топика:",
+                    parse_mode='Markdown'
+                )
+                return ENTER_TOPIC_ID
+            
+            self.user_data[user_id]['selected_topic'] = topic_id
+            self.user_data[user_id]['selected_topic_name'] = f"Топик #{topic_id}"
+            
+            keyboard = [['🔙 Назад']]
+            reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+            
+            chat_name = self.user_data[user_id]['selected_chat_name']
+            await update.message.reply_text(
+                f"✅ Выбран чат: {chat_name}\n"
+                f"🔖 Топик: #{topic_id}\n\n"
+                "📝 Введите название события:",
+                reply_markup=reply_markup
+            )
+            
+            return ENTER_NAME
+            
+        except ValueError:
+            await update.message.reply_text(
+                "❌ Неверный формат. Введите числовое значение ID топика."
+            )
+            return ENTER_TOPIC_ID
         
     async def enter_name(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Ввод названия события"""
@@ -676,7 +1582,6 @@ class TelegramBot:
                 ['🔙 Назад']
             ]
             reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-            
             await query.edit_message_text("🔄 Выберите периодичность публикации:")
             await context.bot.send_message(
                 chat_id=query.message.chat_id,
@@ -684,18 +1589,22 @@ class TelegramBot:
                 reply_markup=reply_markup
             )
             return SELECT_PERIOD
-            
         elif data == "weekdays_done":
             selected_days = self.user_data[user_id].get('selected_weekdays', set())
-            
             if not selected_days:
                 await query.answer("❌ Выберите хотя бы один день недели", show_alert=True)
                 return SELECT_WEEKDAYS
-                
             self.user_data[user_id]['period_value'] = list(selected_days)
-            
             await query.edit_message_text("✅ Дни недели выбраны")
-            return await self.ask_start_date(update, context)
+            # После выбора дней недели переходим к дате начала
+            # Передаем update с message, чтобы ask_start_date работал корректно
+            class FakeUpdate:
+                def __init__(self, message):
+                    self.message = message
+                    self.callback_query = None
+                    self.effective_user = update.effective_user
+            fake_update = FakeUpdate(update.callback_query.message)
+            return await self.ask_start_date(fake_update, context)
             
         elif data.startswith("weekday_"):
             day_num = int(data.split("_")[1])
@@ -902,7 +1811,7 @@ class TelegramBot:
             
             if text.lower() in ['навсегда', 'forever', '♾️ вечное (без окончания)']:
                 forever_value = True
-                end_date_str = ''
+                end_date_str = 'FOREVER'
             else:
                 try:
                     end_date = datetime.strptime(text, "%d.%m.%Y").date()
@@ -938,7 +1847,6 @@ class TelegramBot:
                 for i, row in enumerate(all_values[1:], start=2):  # Начинаем с 2, так как 1 - заголовки
                     if row[0] == event_id:  # ID в первой колонке
                         self.worksheet.update_cell(i, 5, end_date_str)  # Колонка EndDate (5-я)
-                        self.worksheet.update_cell(i, 6, str(forever_value))  # Колонка Forever (6-я)
                         break
                 
                 if forever_value:
@@ -955,7 +1863,7 @@ class TelegramBot:
                 return await self.view_events(update, context)
                 
             except Exception as e:
-                logger.error(f"Ошибка при обновлении даты окончания: {e}")
+                logger.error(f"Ошибка обновления даты окончания: {e}")
                 await update.message.reply_text("❌ Ошибка при обновлении даты окончания.")
                 return ENTER_END_DATE
         
@@ -1137,6 +2045,8 @@ class TelegramBot:
                 for i, row in enumerate(all_values[1:], start=2):  # Начинаем с 2, так как 1 - заголовки
                     if row[0] == event_id:  # ID в первой колонке
                         self.worksheet.update_cell(i, 10, text)  # Колонка Text (10-я)
+                        break  # ID в первой колонке
+                        self.worksheet.update_cell(i, 10, text)  # Колонка Text (10-я)
                         break
                 
                 await update.message.reply_text(f"✅ Текст сообщения обновлен!")
@@ -1193,9 +2103,13 @@ class TelegramBot:
             
         preview_text = data['text'][:100] + "..." if len(data['text']) > 100 else data['text']
         
+        # Формируем информацию о топике
+        topic_name = data.get('selected_topic_name', 'Общий чат')
+        
         confirmation_text = (
             f"📋 **Подтверждение создания события**\n\n"
-            f"📱 Группа: {data['selected_group_name']}\n"
+            f"💬 Чат: {data['selected_chat_name']}\n"
+            f"🔖 Топик: {topic_name}\n"
             f"📝 Название: {data['event_name']}\n"
             f"🔄 Периодичность: {period_desc}\n"
             f"📅 Период: {date_desc}\n"
@@ -1277,7 +2191,442 @@ class TelegramBot:
             
         elif text == '❌ Отмена':
             return await self.cancel(update, context)
+    
+    async def view_events(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Просмотр всех событий"""
+        try:
+            # Получаем все записи из таблицы
+            records = self.worksheet.get_all_records()
             
+            if not records:
+                keyboard = [
+                    ['📝 Создать событие', '📋 Просмотр событий'],
+                    ['ℹ️ Помощь']
+                ]
+                reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+                # Скрываем меню при просмотре событий
+                if update.callback_query:
+                    await update.callback_query.edit_message_text(
+                        "📋 События не найдены.\n\n"
+                        "Создайте первое событие с помощью кнопки '📝 Создать событие'.",
+                        reply_markup=ReplyKeyboardRemove()
+                    )
+                    await context.bot.send_message(
+                        chat_id=update.effective_chat.id,
+                        text="Выберите действие:",
+                        reply_markup=reply_markup
+                    )
+                else:
+                    await update.message.reply_text(
+                        "📋 События не найдены.\n\n"
+                        "Создайте первое событие с помощью кнопки '📝 Создать событие'.",
+                        reply_markup=ReplyKeyboardRemove()
+                    )
+                return MAIN_MENU
+            
+            # Показываем все события, не только активные
+            events_text = "📋 **Список событий:**\n\n"
+            for i, event in enumerate(records, 1):
+                event_id = event.get('ID', 'N/A')
+                chat_identifier = event.get('ChatID', 'N/A')
+                name = str(event.get('Description', 'Без названия'))
+                start_date = event.get('StartDate', 'N/A')
+                end_date = event.get('EndDate', 'N/A')
+                time_val = event.get('Time', 'N/A')
+                period = event.get('PeriodType', 'N/A')
+                status = event.get('Status', 'N/A')
+
+                # Определяем название чата и топика
+                chat_name = ""
+                topic_name = "Общий чат"
+                if str(chat_identifier).startswith('topic:'):
+                    topic_id = str(chat_identifier).split(':')[1]
+                    chat_id = self._get_chat_id_by_topic_id(topic_id)
+                    chat_name = self._get_chat_name_by_id(chat_id) if chat_id else chat_identifier
+                    # Получаем название топика
+                    if hasattr(self, 'topics_worksheet') and self.topics_worksheet:
+                        all_topics = self.topics_worksheet.get_all_records()
+                        for row in all_topics:
+                            if str(row.get('TopicID')) == str(topic_id):
+                                topic_name = row.get('TopicName', topic_name)
+                                break
+                else:
+                    chat_name = self._get_chat_name_by_id(chat_identifier)
+
+                # Периодичность на русском
+                period_type = period
+                period_value = None
+                if str(period).startswith('every_') and str(period).endswith('_days'):
+                    try:
+                        period_value = int(str(period).split('_')[1])
+                        period_type = 'custom_days'
+                    except Exception:
+                        pass
+                elif str(period).startswith('weekdays_'):
+                    try:
+                        weekdays_str = str(period).replace('weekdays_', '')
+                        period_value = [int(x) for x in weekdays_str.split(',') if x.strip()]
+                        period_type = 'weekdays'
+                    except Exception:
+                        pass
+                elif period in PERIOD_TYPES:
+                    period_type = period
+
+                period_display = self._get_period_display_ru(period_type, period_value)
+                status_display = self._get_status_display_ru(status)
+
+                events_text += f"{i}. **{name}**\n"
+                events_text += f"   📍 Чат: {chat_name}\n"
+                events_text += f"   🔖 Топик: {topic_name}\n"
+                events_text += f"   📅 Период: {start_date} - {end_date if end_date != 'FOREVER' else 'Бессрочно'}\n"
+                events_text += f"   ⏰ Время: {time_val}\n"
+                events_text += f"   🔄 Периодичность: {period_display}\n"
+                events_text += f"   🆔 ID: `{event_id}`\n"
+                events_text += f"   📊 Статус: {status_display}\n\n"
+
+            # Создаем inline клавиатуру для управления событиями
+            keyboard = []
+            for event in records[:10]:
+                event_id = event.get('ID', '')
+                name = str(event.get('Description', 'Без названия'))
+                keyboard.append([InlineKeyboardButton(
+                    f"✏️ {name[:20]}...",
+                    callback_data=f"edit_{event_id}"
+                )])
+            keyboard.append([InlineKeyboardButton("🔙 Главное меню", callback_data="back_to_menu")])
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            # Скрываем меню при просмотре событий
+            if update.callback_query:
+                await update.callback_query.edit_message_text(
+                    events_text,
+                    reply_markup=reply_markup,
+                    parse_mode='Markdown'
+                )
+                # Удаляем reply keyboard (меню) для пользователя
+                try:
+                    await context.bot.send_message(
+                        chat_id=update.effective_user.id,
+                        #text="Меню скрыто для просмотра событий.",
+                        reply_markup=ReplyKeyboardRemove()
+                    )
+                except Exception:
+                    pass
+            else:
+                await update.message.reply_text(
+                    events_text,
+                    parse_mode='Markdown',
+                    reply_markup=ReplyKeyboardRemove()
+                )
+                # Отправляем inline клавиатуру отдельным сообщением
+                await update.message.reply_text(
+                    "Выберите событие для управления:",
+                    reply_markup=reply_markup
+                )
+            return EDIT_EVENT
+            
+        except Exception as e:
+            logger.error(f"Ошибка при просмотре событий: {e}")
+            if update.callback_query:
+                await update.callback_query.edit_message_text(
+                    "❌ Ошибка при загрузке событий. Попробуйте позже."
+                )
+            else:
+                await update.message.reply_text(
+                    "❌ Ошибка при загрузке событий. Попробуйте позже."
+                )
+            return VIEW_EVENTS
+    
+    async def handle_view_events(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработчик для состояния VIEW_EVENTS"""
+        return await self.view_events(update, context)
+    
+    async def handle_event_management(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработчик управления событиями"""
+        query = update.callback_query
+        await query.answer()
+        
+        if query.data == "back_to_menu":
+            keyboard = [
+                ['📝 Создать событие', '📋 Просмотр событий'],
+                ['ℹ️ Помощь']
+            ]
+            reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+            
+            await query.edit_message_text("🏠 Главное меню")
+            await context.bot.send_message(
+                chat_id=query.message.chat_id,
+                text="Выберите действие:",
+                reply_markup=reply_markup
+            )
+            return MAIN_MENU
+        
+        elif query.data == "back_to_events":
+            # Возвращаемся к списку событий
+            return await self.view_events(update, context)
+        
+        elif query.data.startswith("edit_"):
+            event_id = query.data.replace("edit_", "")
+            return await self._show_event_edit_menu(update, context, event_id)
+            
+        elif query.data.startswith("deactivate_"):
+            event_id = query.data.replace("deactivate_", "")
+            return await self._deactivate_event(update, context, event_id)
+            
+        elif query.data.startswith("delete_"):
+            event_id = query.data.replace("delete_", "")
+            return await self._delete_event(update, context, event_id)
+            
+        elif query.data.startswith("confirm_delete_"):
+            event_id = query.data.replace("confirm_delete_", "")
+            return await self._confirm_delete_event(update, context, event_id)
+            
+        elif query.data.startswith("cancel_delete_"):
+            event_id = query.data.replace("cancel_delete_", "")
+            return await self._show_event_edit_menu(update, context, event_id)
+            
+        elif query.data.startswith("activate_"):
+            event_id = query.data.replace("activate_", "")
+            return await self._activate_event(update, context, event_id)
+    
+    async def _show_event_edit_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE, event_id: str):
+        """Показывает меню редактирования события"""
+        try:
+            # Получаем данные события
+            records = self.worksheet.get_all_records()
+            event_data = None
+            
+            for record in records:
+                if str(record.get('ID', '')).strip() == str(event_id).strip():
+                    event_data = record
+                    break
+            
+            if not event_data:
+                await update.callback_query.edit_message_text(
+                    "❌ Событие не найдено."
+                )
+                return await self.view_events(update, context)
+            
+            # Определяем название чата и топика
+            chat_identifier = event_data.get('ChatID', 'N/A')
+            chat_name = ""
+            topic_name = "Общий чат"
+            if str(chat_identifier).startswith('topic:'):
+                topic_id = str(chat_identifier).split(':')[1]
+                chat_id = self._get_chat_id_by_topic_id(topic_id)
+                chat_name = self._get_chat_name_by_id(chat_id) if chat_id else chat_identifier
+                # Получаем название топика
+                if hasattr(self, 'topics_worksheet') and self.topics_worksheet:
+                    all_topics = self.topics_worksheet.get_all_records()
+                    for row in all_topics:
+                        if str(row.get('TopicID')) == str(topic_id):
+                            topic_name = row.get('TopicName', topic_name)
+                            break
+            else:
+                chat_name = self._get_chat_name_by_id(chat_identifier)
+
+            # Периодичность и статус на русском
+            period = event_data.get('PeriodType', 'N/A')
+            period_type = period
+            period_value = None
+            if str(period).startswith('every_') and str(period).endswith('_days'):
+                try:
+                    period_value = int(str(period).split('_')[1])
+                    period_type = 'custom_days'
+                except Exception:
+                    pass
+            elif str(period).startswith('weekdays_'):
+                try:
+                    weekdays_str = str(period).replace('weekdays_', '')
+                    period_value = [int(x) for x in weekdays_str.split(',') if x.strip()]
+                    period_type = 'weekdays'
+                except Exception:
+                    pass
+            elif period in PERIOD_TYPES:
+                period_type = period
+            period_display = self._get_period_display_ru(period_type, period_value)
+            status_display = self._get_status_display_ru(event_data.get('Status', 'N/A'))
+
+            event_info = f"📝 **Событие: {event_data.get('Description', 'Без названия')}**\n\n"
+            event_info += f"📍 Чат: {chat_name}\n"
+            event_info += f"🔖 Топик: {topic_name}\n"
+            event_info += f"📅 Период: {event_data.get('StartDate', 'N/A')} - {event_data.get('EndDate', 'N/A')}\n"
+            event_info += f"⏰ Время: {event_data.get('Time', 'N/A')}\n"
+            event_info += f"🔄 Периодичность: {period_display}\n"
+            event_info += f"📊 Статус: {status_display}\n"
+            event_info += f"🆔 ID: `{event_id}`"
+
+            # Кнопка активировать/деактивировать
+            status = event_data.get('Status', 'N/A')
+            if status == 'active':
+                keyboard = [[InlineKeyboardButton("🔴 Деактивировать", callback_data=f"deactivate_{event_id}")]]
+            else:
+                keyboard = [[InlineKeyboardButton("🟢 Активировать", callback_data=f"activate_{event_id}")]]
+            keyboard.append([InlineKeyboardButton("❌ Удалить", callback_data=f"delete_{event_id}")])
+            keyboard.append([InlineKeyboardButton("🔙 Назад к списку", callback_data="back_to_events")])
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            await update.callback_query.edit_message_text(
+                event_info,
+                reply_markup=reply_markup,
+                parse_mode='Markdown'
+            )
+            return EDIT_EVENT
+            
+        except Exception as e:
+            logger.error(f"Ошибка отображения меню события: {e}")
+            await update.callback_query.edit_message_text(
+                "❌ Ошибка загрузки данных события."
+            )
+            return await self.view_events(update, context)
+    
+    async def _activate_event(self, update: Update, context: ContextTypes.DEFAULT_TYPE, event_id: str):
+        """Активирует событие"""
+        try:
+            all_records = self.worksheet.get_all_records()
+            for row_index, record in enumerate(all_records, start=2):
+                if str(record.get('ID', '')).strip() == str(event_id).strip():
+                    self.worksheet.update_cell(row_index, 9, 'active')
+                    break
+            await update.callback_query.edit_message_text(
+                f"✅ Событие {event_id} активировано.\n\nАвтоматические публикации возобновлены.")
+            await asyncio.sleep(2)
+            return await self.view_events(update, context)
+        except Exception as e:
+            logger.error(f"Ошибка активации события: {e}")
+            await update.callback_query.edit_message_text(
+                "❌ Ошибка при активации события.")
+            return EDIT_EVENT
+            
+        except Exception as e:
+            logger.error(f"Ошибка отображения меню события: {e}")
+            await update.callback_query.edit_message_text(
+                "❌ Ошибка загрузки данных события."
+            )
+            return await self.view_events(update, context)
+    
+    async def _deactivate_event(self, update: Update, context: ContextTypes.DEFAULT_TYPE, event_id: str):
+        """Деактивирует событие"""
+        try:
+            # Обновляем статус события в Google Sheets
+            all_records = self.worksheet.get_all_records()
+            for row_index, record in enumerate(all_records, start=2):  # +2 из-за заголовка
+                if str(record.get('ID', '')).strip() == str(event_id).strip():
+                    # Обновляем статус на inactive (колонка 9 - Status)
+                    self.worksheet.update_cell(row_index, 9, 'inactive')
+                    
+                    # Отменяем запланированные задачи для этого события
+                    job_id = f"event_{event_id}"
+                    if self.scheduler.get_job(job_id):
+                        self.scheduler.remove_job(job_id)
+                        logger.info(f"Задача {job_id} удалена из планировщика")
+                    
+                    break
+            
+            await update.callback_query.edit_message_text(
+                f"✅ Событие {event_id} деактивировано.\n\n"
+                f"Автоматические публикации остановлены."
+            )
+            
+            # Автоматически возвращаемся к списку событий через 2 секунды
+            await asyncio.sleep(2)
+            return await self.view_events(update, context)
+            
+        except Exception as e:
+            logger.error(f"Ошибка деактивации события: {e}")
+            await update.callback_query.edit_message_text(
+                "❌ Ошибка при деактивации события."
+            )
+            return EDIT_EVENT
+    
+    async def _delete_event(self, update: Update, context: ContextTypes.DEFAULT_TYPE, event_id: str):
+        """Показывает подтверждение удаления события"""
+        keyboard = [
+            [InlineKeyboardButton("❌ Да, удалить", callback_data=f"confirm_delete_{event_id}")],
+            [InlineKeyboardButton("🔙 Отмена", callback_data=f"cancel_delete_{event_id}")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await update.callback_query.edit_message_text(
+            f"⚠️ **Подтверждение удаления**\n\n"
+            f"Вы действительно хотите удалить событие {event_id}?\n\n"
+            f"Это действие необратимо!",
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+        return EDIT_EVENT
+    
+    async def _confirm_delete_event(self, update: Update, context: ContextTypes.DEFAULT_TYPE, event_id: str):
+        """Подтверждает удаление события"""
+        try:
+            # Удаляем строку из Google Sheets
+            all_records = self.worksheet.get_all_records()
+            for row_index, record in enumerate(all_records, start=2):  # +2 из-за заголовка
+                if str(record.get('ID', '')).strip() == str(event_id).strip():
+                    self.worksheet.delete_rows(row_index)
+                    break
+            
+            await update.callback_query.edit_message_text(
+                f"✅ Событие {event_id} удалено."
+            )
+            
+            # Автоматически возвращаемся к списку событий через 2 секунды
+            await asyncio.sleep(2)
+            return await self.view_events(update, context)
+            
+        except Exception as e:
+            logger.error(f"Ошибка удаления события: {e}")
+            await update.callback_query.edit_message_text(
+                "❌ Ошибка при удалении события."
+            )
+            return EDIT_EVENT
+    
+    def _get_chat_id_by_topic_id(self, topic_id: int) -> Optional[int]:
+        """Получает ChatID по TopicID из таблицы Topics"""
+        try:
+            if not hasattr(self, 'topics_worksheet') or self.topics_worksheet is None:
+                logger.error("Topics worksheet не инициализирован")
+                return None
+                
+            all_data = self.topics_worksheet.get_all_records()
+            
+            for row in all_data:
+                if str(row.get('TopicID')) == str(topic_id):
+                    chat_id = row.get('ChatID')
+                    if chat_id:
+                        try:
+                            return int(chat_id)
+                        except (ValueError, TypeError):
+                            continue
+            
+            logger.warning(f"ChatID не найден для TopicID {topic_id}")
+            return None
+            
+        except Exception as e:
+            logger.error(f"Ошибка получения ChatID по TopicID {topic_id}: {e}")
+            return None
+
+    def _parse_chat_identifier(self, chat_identifier) -> Tuple[int, Optional[int]]:
+        """Парсит идентификатор чата и возвращает (chat_id, topic_id)"""
+        try:
+            # Конвертируем в строку если передан int
+            chat_str = str(chat_identifier)
+            
+            if chat_str.startswith('topic:'):
+                # Формат: topic:123
+                topic_id = int(chat_str.split(':')[1])
+                chat_id = self._get_chat_id_by_topic_id(topic_id)
+                if chat_id is None:
+                    logger.error(f"Не удалось найти ChatID для TopicID {topic_id}")
+                    return None, None
+                return chat_id, topic_id
+            else:
+                # Обычный ChatID
+                return int(chat_str), None
+        except (ValueError, IndexError) as e:
+            logger.error(f"Ошибка парсинга идентификатора чата '{chat_identifier}': {e}")
+            return None, None
+
     async def _save_event_to_sheets(self, user_id: int) -> str:
         """Сохранение события в Google Sheets"""
         data = self.user_data[user_id]
@@ -1285,24 +2634,58 @@ class TelegramBot:
         # Генерируем уникальный ID события
         event_id = str(uuid.uuid4())[:8]
         
-        # Подготавливаем данные для сохранения
-        # Структура: ID, ChatID, Description, StartDate, EndDate, Forever, Time, PeriodType, PeriodValue, Text, Status
+        # Подготавливаем данные для сохранения согласно структуре:
+        # 1. ID события
+        # 2. Идентификатор чата (ChatID или topic:X)
+        # 3. Название/описание события  
+        # 4. Дата начала
+        # 5. Дата окончания (или флаг вечности)
+        # 6. Время публикации
+        # 7. Периодичность
+        # 8. Текст сообщения
+        # 9. Статус (активно/завершено)
+        
+        # Формируем дату окончания - если forever=True, то 'FOREVER', иначе дата окончания
+        end_date_str = ''
+        if data.get('forever'):
+            end_date_str = 'FOREVER'
+        elif data.get('end_date'):
+            end_date_str = data['end_date'].strftime('%Y-%m-%d')
+        
+        # Формируем строку периодичности
+        period_str = data['period_type']
+        if data.get('period_value'):
+            if data['period_type'] == 'custom_days':
+                period_str = f"every_{data['period_value']}_days"
+            elif data['period_type'] == 'weekdays':
+                weekdays = data['period_value'] if isinstance(data['period_value'], list) else []
+                period_str = f"weekdays_{','.join(map(str, weekdays))}"
+        
+        # НОВАЯ ЛОГИКА: Формируем идентификатор чата
+        topic_id = data.get('selected_topic', None)
+        if topic_id is not None:
+            # Если выбран топик, сохраняем topic:X
+            chat_identifier = f"topic:{topic_id}"
+        else:
+            # Если общий чат, сохраняем реальный ChatID
+            chat_identifier = str(data['selected_chat'])
+        
         row_data = [
-            event_id,
-            str(data['selected_group']),
-            data['event_name'],  # Description
-            data['start_date'].strftime('%Y-%m-%d'),
-            data['end_date'].strftime('%Y-%m-%d') if data.get('end_date') else '',
-            'TRUE' if data.get('forever') else 'FALSE',
-            data['time'].strftime('%H:%M'),
-            data['period_type'],
-            json.dumps(data['period_value']) if data['period_value'] else '',
-            data['text'],
-            'active'
+            event_id,                                    # 1. ID события
+            chat_identifier,                             # 2. ChatID или topic:X
+            data['event_name'],                          # 3. Название/описание события
+            data['start_date'].strftime('%Y-%m-%d'),     # 4. Дата начала
+            end_date_str,                                # 5. Дата окончания
+            data['time'].strftime('%H:%M'),              # 6. Время публикации
+            period_str,                                  # 7. Периодичность (без TopicID)
+            data['text'],                                # 8. Текст сообщения
+            'active'                                     # 9. Статус
         ]
         
         try:
             logger.info("Сохранение события в Google Sheets началось")
+            logger.info(f"Данные события: ChatIdentifier={chat_identifier}, TopicID={topic_id}, Period={period_str}")
+            
             # Добавляем строку в таблицу
             self.worksheet.append_row(row_data)
             logger.info("Событие успешно сохранено в Google Sheets")
@@ -1323,21 +2706,42 @@ class TelegramBot:
     async def _schedule_next_publication(self, event_data: Dict, job_queue=None):
         """Планирование следующей публикации"""
         try:
-            start_date = datetime.strptime(event_data['StartDate'], '%Y-%m-%d').date()
-            end_date = datetime.strptime(event_data['EndDate'], '%Y-%m-%d').date() if event_data['EndDate'] else None
-            forever = event_data['Forever'] == 'TRUE'
-            time_obj = datetime.strptime(event_data['Time'], '%H:%M').time()
-            period_type = event_data['PeriodType']
+            logger.info(f"🔄 Начинаем планирование следующей публикации для события {event_data.get('ID', 'Unknown')}")
             
-            # Парсим period_value
+            start_date = datetime.strptime(event_data['StartDate'], '%Y-%m-%d').date()
+            end_date_str = event_data.get('EndDate', '')
+            end_date = None
+            forever = False
+            
+            if end_date_str == 'FOREVER':
+                forever = True
+            elif end_date_str:
+                end_date = datetime.strptime(end_date_str, '%Y-%m-%d').date()
+            
+            time_obj = datetime.strptime(event_data['Time'], '%H:%M').time()
+            
+            # ИСПРАВЛЕНИЕ: Правильно парсим period_type, отделяя TopicID
+            period_type_full = event_data['PeriodType']
+            period_type = period_type_full
+            
+            # Отделяем TopicID от периодичности
+            if '|topic:' in period_type_full:
+                period_type = period_type_full.split('|topic:')[0]
+            
+            # Парсим period_type для получения дополнительных параметров
             period_value = None
-            if event_data['PeriodValue']:
+            if period_type.startswith('every_') and period_type.endswith('_days'):
                 try:
-                    if period_type == 'weekdays':
-                        period_value = json.loads(event_data['PeriodValue'])
-                    else:
-                        period_value = int(event_data['PeriodValue'])
-                except (json.JSONDecodeError, ValueError):
+                    period_value = int(period_type.split('_')[1])
+                    period_type = 'custom_days'
+                except (IndexError, ValueError):
+                    period_value = None
+            elif period_type.startswith('weekdays_'):
+                try:
+                    weekdays_str = period_type.replace('weekdays_', '')
+                    period_value = [int(x) for x in weekdays_str.split(',') if x.strip()]
+                    period_type = 'weekdays'
+                except ValueError:
                     period_value = None
             
             # Вычисляем время следующей публикации
@@ -1347,798 +2751,188 @@ class TelegramBot:
             if period_type == 'once':
                 next_datetime = datetime.combine(start_date, time_obj)
                 if next_datetime <= now:
-                    # Событие уже прошло
-                    logger.info(f"Одноразовое событие {event_data['ID']} уже прошло")
+                    # Событие уже прошло - помечаем как выполненное
+                    logger.info(f"Одноразовое событие {event_data['ID']} уже прошло, помечаем как выполненное")
+                    await self._update_event_status(event_data['ID'], 'complete')
+                    return
+                
+                # Проверяем, что одноразовое событие не превышает дату окончания
+                if end_date and not forever and start_date > end_date:
+                    logger.info(f"Одноразовое событие {event_data['ID']} завершено: дата события ({start_date}) превышает дату окончания ({end_date}) включительно")
+                    await self._update_event_status(event_data['ID'], 'complete')
                     return
                     
             elif period_type == 'daily':
-                next_datetime = datetime.combine(start_date, time_obj)
-                while next_datetime <= now:
-                    next_datetime += timedelta(days=1)
-                    
+                # Ежедневная публикация
+                next_date = start_date
+                while next_date <= datetime.now().date():
+                    next_date += timedelta(days=1)
+                next_datetime = datetime.combine(next_date, time_obj)
+                
             elif period_type == 'weekly':
-                next_datetime = datetime.combine(start_date, time_obj)
-                while next_datetime <= now:
-                    next_datetime += timedelta(weeks=1)
-                    
+                # Еженедельная публикация
+                next_date = start_date
+                while next_date <= datetime.now().date():
+                    next_date += timedelta(weeks=1)
+                next_datetime = datetime.combine(next_date, time_obj)
+                
             elif period_type == 'monthly':
-                next_datetime = datetime.combine(start_date, time_obj)
-                while next_datetime <= now:
-                    if next_datetime.month == 12:
-                        next_datetime = next_datetime.replace(year=next_datetime.year + 1, month=1)
+                # Ежемесячная публикация
+                next_date = start_date
+                while next_date <= datetime.now().date():
+                    if next_date.month == 12:
+                        next_date = next_date.replace(year=next_date.year + 1, month=1)
                     else:
-                        next_datetime = next_datetime.replace(month=next_datetime.month + 1)
-                        
+                        next_date = next_date.replace(month=next_date.month + 1)
+                next_datetime = datetime.combine(next_date, time_obj)
+                
             elif period_type == 'custom_days' and period_value:
-                next_datetime = datetime.combine(start_date, time_obj)
-                while next_datetime <= now:
-                    next_datetime += timedelta(days=period_value)
-                    
+                # Каждые N дней
+                next_date = start_date
+                while next_date <= datetime.now().date():
+                    next_date += timedelta(days=period_value)
+                next_datetime = datetime.combine(next_date, time_obj)
+                
             elif period_type == 'weekdays' and period_value:
-                # Найти ближайший день недели из списка
-                current_date = max(start_date, now.date())
-                found = False
-                for i in range(14):  # Проверяем следующие 2 недели
-                    check_date = current_date + timedelta(days=i)
-                    if check_date.weekday() in period_value:
-                        check_datetime = datetime.combine(check_date, time_obj)
-                        if check_datetime > now:
-                            next_datetime = check_datetime
-                            found = True
-                            break
-                if not found:
-                    logger.warning(f"Не найден подходящий день недели для события {event_data['ID']}")
-                    return
-                    
+                # В определённые дни недели
+                next_date = start_date
+                while True:
+                    if next_date.weekday() in period_value and next_date > datetime.now().date():
+                        break
+                    next_date += timedelta(days=1)
+                next_datetime = datetime.combine(next_date, time_obj)
+            
             # Проверяем, не превышает ли дата окончания
-            if not forever and end_date and next_datetime and next_datetime.date() > end_date:
-                # Событие завершено
-                logger.info(f"Событие {event_data['ID']} завершено (дата окончания: {end_date})")
-                await self._update_event_status(event_data['ID'], 'completed')
+            if next_datetime is None:
+                logger.warning(f"Не удалось определить время следующей публикации для события {event_data['ID']} с типом периодичности '{period_type}' (исходная строка: '{period_type_full}')")
                 return
                 
-            # Планируем задачу в APScheduler
-            if next_datetime and next_datetime > now:
-                job_id = f"event_{event_data['ID']}_{int(next_datetime.timestamp())}"
-                
-                # Удаляем старые задачи для этого события
-                existing_jobs = [job for job in self.scheduler.get_jobs() if job.id.startswith(f"event_{event_data['ID']}_")]
-                for job in existing_jobs:
-                    job.remove()
-                
-                # Добавляем новую задачу
-                self.scheduler.add_job(
-                    func=self._publish_message_sync,
-                    trigger='date',
-                    run_date=next_datetime,
-                    args=[event_data],
-                    id=job_id,
-                    misfire_grace_time=300  # 5 минут grace time
-                )
-                
-                logger.info(f"Запланирована публикация события {event_data['ID']} на {next_datetime}")
-            else:
-                logger.warning(f"Не удалось вычислить время следующей публикации для события {event_data['ID']}")
-                
+            if end_date and not forever and next_datetime.date() > end_date:
+                logger.info(f"Событие {event_data['ID']} завершено: дата следующей публикации ({next_datetime.date()}) превышает дату окончания ({end_date}) включительно")
+                # Обновляем статус события на 'complete'
+                await self._update_event_status(event_data['ID'], 'complete')
+                return
+            
+            if next_datetime:
+                # Планируем задачу
+                if hasattr(self, 'scheduler'):
+                    # Добавляем небольшую случайную задержку (0-5 секунд) для предотвращения коллизий
+                    import random
+                    random_delay = random.randint(0, 5)
+                    next_datetime_with_delay = next_datetime + timedelta(seconds=random_delay)
+                    
+                    # Используем более уникальный job_id, включающий микросекунды для избежания коллизий
+                    timestamp_str = str(next_datetime_with_delay.timestamp()).replace('.', '_')
+                    job_id = f"event_{event_data['ID']}_{timestamp_str}"
+                    
+                    # Проверяем, не существует ли уже такая задача
+                    existing_job = self.scheduler.get_job(job_id)
+                    if existing_job:
+                        logger.warning(f"⚠️ Задача {job_id} уже существует, перезаписываем")
+                    
+                    self.scheduler.add_job(
+                        self._publish_message_async,
+                        'date',
+                        run_date=next_datetime_with_delay,
+                        args=[event_data],
+                        id=job_id,
+                        replace_existing=True
+                    )
+                    
+                    if random_delay > 0:
+                        logger.info(f"✅ Запланирована публикация события {event_data['ID']} на {next_datetime_with_delay} (задержка: {random_delay}с, job_id: {job_id})")
+                    else:
+                        logger.info(f"✅ Запланирована публикация события {event_data['ID']} на {next_datetime_with_delay} (job_id: {job_id})")
+                else:
+                    logger.error(f"❌ Scheduler не найден для события {event_data['ID']}")
         except Exception as e:
-            logger.error(f"Ошибка планирования публикации для события {event_data['ID']}: {e}")
-            await self._update_event_status(event_data['ID'], 'error')
+            logger.error(f"Ошибка планирования публикации: {e}")
+            logger.exception("Полная трассировка ошибки:")
     
-    def _publish_message_sync(self, event_data: Dict):
-        """Синхронная обертка для публикации сообщения (для APScheduler)"""
-        import asyncio
-        
-        # Создаем новый event loop если его нет
+    async def _update_event_status(self, event_id: str, status: str):
+        """Обновление статуса события в Google Sheets"""
         try:
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-        
-        if loop.is_running():
-            # Если event loop уже запущен, создаем задачу
-            asyncio.create_task(self._publish_message_async(event_data))
-        else:
-            # Если event loop не запущен, запускаем его
-            loop.run_until_complete(self._publish_message_async(event_data))
+            all_values = self.worksheet.get_all_values()
+            for i, row in enumerate(all_values[1:], start=2):  # Начинаем с 2, так как 1 - заголовки
+                if row[0] == event_id:  # ID в первой колонке
+                    self.worksheet.update_cell(i, 9, status)  # Колонка Status (9-я в новой структуре)
+                    break
+            logger.info(f"Статус события {event_id} обновлен на {status}")
+        except Exception as e:
+            logger.error(f"Ошибка обновления статуса события {event_id}: {e}")
     
     async def _publish_message_async(self, event_data: Dict):
         """Асинхронная публикация сообщения"""
         try:
-            chat_id = int(event_data['ChatID'])
+            logger.info(f"Начинается публикация для события {event_data['ID']}")
+            
+            # Используем новую логику парсинга идентификатора чата
+            chat_identifier = event_data['ChatID']
+            logger.info(f"ChatIdentifier: {chat_identifier}")
+            
+            chat_id, topic_id = self._parse_chat_identifier(chat_identifier)
+            logger.info(f"Результат парсинга: chat_id={chat_id}, topic_id={topic_id}")
+            
+            if chat_id is None:
+                logger.error(f"Не удалось определить chat_id для события {event_data['ID']}")
+                return
+            
             text = event_data['Text']
             
-            # Создаем bot объект для отправки сообщения
-            from telegram import Bot
-            bot = Bot(token=self.token)
-            
-            await bot.send_message(chat_id=chat_id, text=text)
-            logger.info(f"Опубликовано сообщение для события {event_data['ID']} в чат {chat_id}")
-            
-            # Планируем следующую публикацию для повторяющихся событий
-            if event_data['PeriodType'] != 'once':
-                await self._schedule_next_publication(event_data)
-            else:
-                # Для одноразовых событий обновляем статус на completed
-                await self._update_event_status(event_data['ID'], 'completed')
-                logger.info(f"Одноразовое событие {event_data['ID']} завершено")
-                
-        except Exception as e:
-            logger.error(f"Ошибка публикации сообщения для события {event_data['ID']}: {e}")
-            await self._update_event_status(event_data['ID'], 'error')
-            
-    async def _update_event_status(self, event_id: str, status: str):
-        """Обновление статуса события"""
-        try:
-            rows = self.worksheet.get_all_records()
-            for i, row in enumerate(rows, start=2):  # start=2 because row 1 is header
-                if row['ID'] == event_id:
-                    self.worksheet.update_cell(i, 11, status)  # Column 11 is Status
-                    break
-        except Exception as e:
-            logger.error(f"Ошибка обновления статуса события: {e}")
-            
-    async def view_events(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Просмотр событий"""
-        user_id = update.effective_user.id
-        
-        # Получаем группы, где пользователь является администратором
-        admin_groups = await self._get_user_admin_groups(user_id, context.bot)
-        
-        if not admin_groups:
-            await update.message.reply_text(
-                "❌ У вас нет групп, где вы являетесь администратором."
-            )
-            return MAIN_MENU
-            
-        # Получаем события для этих групп
-        try:
-            rows = self.worksheet.get_all_records()
-            user_events = []
-            
-            for row in rows:
-                if str(row.get('ChatID', '')) in admin_groups.keys():
-                    user_events.append(row)
-                    
-            if not user_events:
-                await update.message.reply_text(
-                    "📋 У вас пока нет созданных событий."
-                )
-                return MAIN_MENU
-                
-            # Группируем события по группам
-            events_by_group = {}
-            for event in user_events:
-                chat_id = str(event.get('ChatID', ''))
-                if chat_id in admin_groups:
-                    group_name = admin_groups[chat_id]
-                    if group_name not in events_by_group:
-                        events_by_group[group_name] = []
-                    events_by_group[group_name].append(event)
-                
-            # Создаем клавиатуру с группами
-            keyboard = []
-            for group_name in events_by_group.keys():
-                keyboard.append([f"📱 {group_name}"])
-            keyboard.append(['🔙 Назад'])
-            
-            reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-            
-            await update.message.reply_text(
-                "📋 Выберите группу для просмотра событий:",
-                reply_markup=reply_markup
-            )
-            
-            # Сохраняем данные для дальнейшей обработки
-            self.user_data[user_id] = {
-                'events_by_group': events_by_group,
-                'admin_groups': admin_groups
+            # Подготавливаем параметры для отправки сообщения
+            send_params = {
+                'chat_id': chat_id,
+                'text': text,
+                'parse_mode': None
             }
             
-            return VIEW_EVENTS
-            
-        except Exception as e:
-            logger.error(f"Ошибка получения событий: {e}")
-            await update.message.reply_text(
-                "❌ Ошибка при получении событий. Попробуйте позже."
-            )
-            return MAIN_MENU
-            
-    async def show_group_events(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Показ событий группы"""
-        user_id = update.effective_user.id
-        text = update.message.text
-
-        if text == '🔙 Назад':
-            return await self.back_to_main_menu(update, context)
-
-        if user_id not in self.user_data:
-            return await self.view_events(update, context)
-
-        events_by_group = self.user_data[user_id]['events_by_group']
-
-        # Найти выбранную группу
-        selected_group = None
-        for group_name in events_by_group.keys():
-            if text == f"📱 {group_name}":
-                selected_group = group_name
-                break
-
-        if not selected_group:
-            await update.message.reply_text(
-                "❌ Группа не найдена. Выберите группу из списка."
-            )
-            return VIEW_EVENTS
-
-        events = events_by_group[selected_group]
-
-        # Формируем список событий
-        events_text = f"📋 **События группы {selected_group}:**\n\n"
-
-        for i, event in enumerate(events, 1):
-            status_emoji = {
-                'active': '🟢',
-                'completed': '✅',
-                'error': '❌'
-            }.get(event['Status'], '⚪')
-
-            period_desc = self._get_period_description(event)
-
-            description = str(event.get('Description', ''))  # Ensure Description is a string
-
-            events_text += (
-                f"{i}. {status_emoji} **{description}**\n"
-                f"   ID: `{event['ID']}`\n"
-                f"   Период: {period_desc}\n"
-                f"   Время: {event['Time']}\n"
-                f"   Статус: {event['Status']}\n\n"
-            )
-
-        # Создаем inline клавиатуру для управления событиями
-        keyboard = []
-        for event in events:
-            description = str(event.get('Description', ''))  # Ensure Description is a string
-            keyboard.append([
-                InlineKeyboardButton(
-                    f"✏️ {description[:30]}...",
-                    callback_data=f"edit_{event['ID']}"
-                )
-            ])
-
-        keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="back_to_groups")])
-
-        reply_markup = InlineKeyboardMarkup(keyboard)
-
-        await update.message.reply_text(
-            events_text,
-            reply_markup=reply_markup,
-            parse_mode='Markdown'
-        )
-
-        return EDIT_EVENT
-        
-    def _get_period_description(self, event: Dict) -> str:
-        """Получение описания периодичности события"""
-        period_type = event['PeriodType']
-        period_value = event['PeriodValue']
-        
-        if period_type == 'daily':
-            return "Ежедневно"
-        elif period_type == 'weekly':
-            return "Еженедельно"
-        elif period_type == 'monthly':
-            return "Ежемесячно"
-        elif period_type == 'once':
-            return "Без повторения"
-        elif period_type == 'custom_days':
-            return f"Каждые {period_value} дн."
-        elif period_type == 'weekdays':
-            try:
-                days = json.loads(period_value) if period_value else []
-                day_names = [WEEKDAYS[d].replace('📅 ', '') for d in sorted(days)]
-                return f"По дням: {', '.join(day_names)}"
-            except:
-                return "Определённые дни недели"
-        else:
-            return "Неизвестно"
-            
-    async def handle_event_management(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработка управления событиями"""
-        query = update.callback_query
-        await query.answer()
-        
-        data = query.data
-        
-        if data == "back_to_groups":
-            user_id = update.effective_user.id
-            events_by_group = self.user_data[user_id]['events_by_group']
-            
-            keyboard = []
-            for group_name in events_by_group.keys():
-                keyboard.append([f"📱 {group_name}"])
-            keyboard.append(['🔙 Назад'])
-            
-            reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-            
-            await query.edit_message_text("📋 Выберите группу для просмотра событий:")
-            await context.bot.send_message(
-                chat_id=query.message.chat_id,
-                text="📋 Выберите группу для просмотра событий:",
-                reply_markup=reply_markup
-            )
-            return VIEW_EVENTS
-            
-        elif data == "back_to_events":
-            # Возвращаемся к списку событий группы
-            user_id = update.effective_user.id
-            if user_id in self.user_data and 'events_by_group' in self.user_data[user_id]:
-                events_by_group = self.user_data[user_id]['events_by_group']
-                
-                keyboard = []
-                for group_name in events_by_group.keys():
-                    keyboard.append([f"📱 {group_name}"])
-                keyboard.append(['🔙 Назад'])
-                
-                reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-                
-                await query.edit_message_text("📋 Выберите группу для просмотра событий:")
-                await context.bot.send_message(
-                    chat_id=query.message.chat_id,
-                    text="📋 Выберите группу для просмотра событий:",
-                    reply_markup=reply_markup
-                )
-                return VIEW_EVENTS
+            # Добавляем ID топика если он указан
+            if topic_id is not None:
+                send_params['message_thread_id'] = topic_id
+                logger.info(f"Публикация в топик {topic_id} чата {chat_id}")
             else:
-                # Если нет данных, возвращаемся к главному меню
-                keyboard = [
-                    ['📝 Создать событие', '📋 Просмотр событий'],
-                    ['ℹ️ Помощь']
-                ]
-                reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+                logger.info(f"Публикация в общий чат {chat_id}")
+            
+            # Отправляем сообщение
+            if hasattr(self, 'application') and self.application:
+                await self.application.bot.send_message(**send_params)
                 
-                await query.edit_message_text("🏠 Главное меню")
-                await context.bot.send_message(
-                    chat_id=query.message.chat_id,
-                    text="🏠 Главное меню",
-                    reply_markup=reply_markup
-                )
-                return MAIN_MENU
-            
-        elif data.startswith("confirm_delete_"):
-            event_id = data.split("_", 2)[2]
-            logger.info(f"Подтверждение удаления события с ID: {event_id}")
-            return await self._confirm_delete_event(update, context, event_id)
-            
-        elif data.startswith("delete_"):
-            event_id = data.split("_", 1)[1]
-            logger.info(f"Удаление события с ID: {event_id}")
-            return await self._delete_event(update, context, event_id)
-            
-        elif data.startswith("edit_field_"):
-            # Обработка редактирования конкретного поля
-            # Убираем префикс "edit_field_" и парсим остальное
-            field_and_id = data[11:]  # Убираем "edit_field_"
-            
-            # Определяем тип поля по началу строки
-            if field_and_id.startswith("name_"):
-                field_type = "name"
-                event_id = field_and_id[5:]  # Убираем "name_"
-            elif field_and_id.startswith("start_date_"):
-                field_type = "start_date"
-                event_id = field_and_id[11:]  # Убираем "start_date_"
-            elif field_and_id.startswith("end_date_"):
-                field_type = "end_date"
-                event_id = field_and_id[9:]  # Убираем "end_date_"
-            elif field_and_id.startswith("time_"):
-                field_type = "time"
-                event_id = field_and_id[5:]  # Убираем "time_"
-            elif field_and_id.startswith("text_"):
-                field_type = "text"
-                event_id = field_and_id[5:]  # Убираем "text_"
-            elif field_and_id.startswith("period_"):
-                field_type = "period"
-                event_id = field_and_id[7:]  # Убираем "period_"
+                topic_info = f" в топик {topic_id}" if topic_id else ""
+                logger.info(f"Сообщение опубликовано в чат {chat_id}{topic_info} для события {event_data['ID']}")
+                
+                # Планируем следующую публикацию если нужно
+                if event_data['PeriodType'] != 'once':
+                    logger.info(f"📅 Планируем следующую публикацию для повторяющегося события {event_data['ID']}")
+                    await self._schedule_next_publication(event_data)
+                else:
+                    logger.info(f"📅 Событие {event_data['ID']} одноразовое, помечаем как выполненное")
+                    await self._update_event_status(event_data['ID'], 'complete')
             else:
-                # Fallback на старый метод
-                parts = data.split("_")
-                field_type = parts[2]
-                event_id = "_".join(parts[3:])
+                logger.error("Application не найден - невозможно отправить сообщение")
                 
-            logger.info(f"Редактирование поля {field_type} для события {event_id}")
-            
-            # Проверяем статус события перед редактированием
-            try:
-                rows = self.worksheet.get_all_records()
-                event_data = None
-                for row in rows:
-                    row_id = row.get('ID') or row.get('id') or row.get('Id')
-                    if row_id and str(row_id).strip() == str(event_id).strip():
-                        event_data = row
-                        break
-                
-                if not event_data:
-                    await query.edit_message_text("❌ Событие не найдено.")
-                    return EDIT_EVENT
-                
-                event_status = event_data.get('Status', 'active').lower()
-                if event_status in ['completed', 'завершено', 'error', 'ошибка']:
-                    await query.edit_message_text(
-                        "⚠️ **Завершенное событие изменить нельзя**\n\n"
-                        "Это событие уже завершено и не может быть отредактировано."
-                    )
-                    return EDIT_EVENT
-                    
-            except Exception as e:
-                logger.error(f"Ошибка при проверке статуса события: {e}")
-                await query.edit_message_text("❌ Ошибка при проверке статуса события.")
-                return EDIT_EVENT
-            
-            # Сохраняем ID события для последующего использования
-            user_id = update.effective_user.id
-            if user_id not in self.user_data:
-                self.user_data[user_id] = {}
-            self.user_data[user_id]['editing_event_id'] = event_id
-            self.user_data[user_id]['editing_field'] = field_type
-            
-            if field_type == "name":
-                await query.edit_message_text("✏️ Введите новое название события:")
-                return ENTER_NAME
-            elif field_type == "start_date":
-                await query.edit_message_text("📅 Введите новую дату начала (ДД.ММ.ГГГГ):")
-                return ENTER_START_DATE
-            elif field_type == "end_date":
-                await query.edit_message_text("📅 Введите новую дату окончания (ДД.ММ.ГГГГ) или 'навсегда' для бессрочного события:")
-                return ENTER_END_DATE
-            elif field_type == "time":
-                await query.edit_message_text("🕐 Введите новое время (ЧЧ:ММ):")
-                return ENTER_TIME
-            elif field_type == "text":
-                await query.edit_message_text("📝 Введите новый текст сообщения:")
-                return ENTER_TEXT
-            elif field_type == "period":
-                # Показываем меню выбора периодичности
-                keyboard = [
-                    ['📅 Ежедневно', '📅 Еженедельно'],
-                    ['📅 Ежемесячно', '📅 Без повторения'],
-                    ['📅 Каждые N дней', '📅 В определённые дни недели'],
-                    ['🔙 Назад']
-                ]
-                reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-                
-                await query.edit_message_text("🔄 Выберите новую периодичность:")
-                await context.bot.send_message(
-                    chat_id=query.message.chat_id,
-                    text="🔄 Выберите новую периодичность:",
-                    reply_markup=reply_markup
-                )
-                return SELECT_PERIOD
-            
-            return EDIT_EVENT
-            
-        elif data.startswith("edit_") and not data.startswith("edit_field_"):
-            event_id = data.split("_", 1)[1]
-            logger.info(f"Обработка редактирования события с ID: {event_id}")
-            return await self._show_event_edit_menu(update, context, event_id)
-            
-    async def _show_event_edit_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE, event_id: str):
-        """Показ меню редактирования события"""
-        query = update.callback_query
-
-        # Получаем данные события
-        try:
-            rows = self.worksheet.get_all_records()
         except Exception as e:
-            logger.error(f"Ошибка при получении данных из Google Sheets: {e}")
-            await query.edit_message_text("❌ Ошибка при получении данных из Google Sheets.")
-            return EDIT_EVENT
-
-        if not rows:
-            logger.warning("Google Sheets не содержит строк данных.")
-            await query.edit_message_text("❌ Событие не найдено.")
-            return EDIT_EVENT
-
-        logger.info(f"Получено {len(rows)} строк из Google Sheets")
-        logger.debug(f"Структура данных: {rows}")
-
-        # Log the keys of the first row for header debugging
-        first_row_keys = list(rows[0].keys())
-        logger.info(f"Ключи первой строки таблицы: {first_row_keys}")
-        if 'ID' not in first_row_keys:
-            logger.warning("Внимание: В таблице нет столбца 'ID'. Проверьте заголовки!")
-
-        event_data = None
-
-        logger.info(f"Ищем событие с ID: {event_id}")
-        for row in rows:
-            logger.debug(f"Проверяем строку: {row}")
-            # Fallback logic for ID field
-            row_id = row.get('ID') or row.get('id') or row.get('Id')
-            if row_id is None:
-                logger.warning(f"Строка без ID: {row}")
-                continue
-            if not isinstance(row_id, str):
-                logger.warning(f"ID не является строкой: {row_id} в строке {row}")
-                row_id = str(row_id)
-            row_id = row_id.strip()
-            if row_id == str(event_id).strip():
-                event_data = row
-                break
-
-        if not event_data:
-            logger.error(f"Событие с ID {event_id} не найдено в Google Sheets")
-            logger.debug(f"Проверенные строки: {rows}")
-            await query.edit_message_text("❌ Событие не найдено.")
-            return EDIT_EVENT
-
-        # Формируем информацию о событии
-        period_desc = self._get_period_description(event_data)
-        
-        text = str(event_data.get('Text', ''))  # Ensure Text is a string
-        event_status = event_data.get('Status', 'active').lower()
-
-        event_info = (
-            f"📝 **Событие: {event_data['Description']}**\n\n"
-            f"🆔 ID: `{event_data.get('ID', 'N/A')}`\n"
-            f"🔄 Период: {period_desc}\n"
-            f"📅 Начало: {event_data.get('StartDate', 'N/A')}\n"
-            f"📅 Окончание: {event_data.get('EndDate', 'Вечно')}\n"
-            f"🕐 Время: {event_data.get('Time', 'N/A')}\n"
-            f"📊 Статус: {event_data.get('Status', 'N/A')}\n\n"
-            f"📄 **Текст:**\n{text[:200]}{'...' if len(text) > 200 else ''}"
-        )
-        
-        # Проверяем статус события - завершенные события нельзя редактировать
-        if event_status in ['completed', 'завершено', 'error', 'ошибка']:
-            event_info += f"\n\n⚠️ **Событие завершено и не может быть изменено**"
-            keyboard = [
-                [InlineKeyboardButton("🔙 Назад", callback_data="back_to_events")]
-            ]
-        else:
-            keyboard = [
-                [InlineKeyboardButton("✏️ Изменить название", callback_data=f"edit_field_name_{event_id}")],
-                [InlineKeyboardButton("📅 Дата начала", callback_data=f"edit_field_start_date_{event_id}")],
-                [InlineKeyboardButton("📅 Дата окончания", callback_data=f"edit_field_end_date_{event_id}")],
-                [InlineKeyboardButton("🕐 Изменить время", callback_data=f"edit_field_time_{event_id}")],
-                [InlineKeyboardButton("📝 Изменить текст", callback_data=f"edit_field_text_{event_id}")],
-                [InlineKeyboardButton("🔄 Изменить периодичность", callback_data=f"edit_field_period_{event_id}")],
-                [InlineKeyboardButton("🗑️ Удалить событие", callback_data=f"delete_{event_id}")],
-                [InlineKeyboardButton("🔙 Назад", callback_data="back_to_events")]
-            ]
-        
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await query.edit_message_text(
-            event_info,
-            reply_markup=reply_markup,
-            parse_mode='Markdown'
-        )
-        
-        return EDIT_EVENT
-        
-    async def _delete_event(self, update: Update, context: ContextTypes.DEFAULT_TYPE, event_id: str):
-        """Удаление события"""
-        query = update.callback_query
-        
-        try:
-            # Получаем все строки из таблицы
-            rows = self.worksheet.get_all_records()
-            
-            if not rows:
-                await query.edit_message_text("❌ Таблица пуста.")
-                return EDIT_EVENT
-            
-            # Ищем строку с нужным ID
-            row_to_delete = None
-            row_index = None
-            
-            for i, row in enumerate(rows):
-                row_id = row.get('ID') or row.get('id') or row.get('Id')
-                if row_id and str(row_id).strip() == str(event_id).strip():
-                    row_to_delete = row
-                    row_index = i + 2  # +2 because sheets are 1-indexed and first row is header
-                    break
-            
-            if not row_to_delete:
-                await query.edit_message_text("❌ Событие не найдено для удаления.")
-                return EDIT_EVENT
-            
-            # Показываем подтверждение удаления
-            event_name = row_to_delete.get('Description', 'Без названия')
-            
-            keyboard = [
-                [InlineKeyboardButton("✅ Да, удалить", callback_data=f"confirm_delete_{event_id}")],
-                [InlineKeyboardButton("❌ Отмена", callback_data=f"edit_{event_id}")]
-            ]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            
-            await query.edit_message_text(
-                f"⚠️ **Подтверждение удаления**\n\n"
-                f"Вы действительно хотите удалить событие?\n"
-                f"📝 **{event_name}**\n"
-                f"🆔 ID: `{event_id}`\n\n"
-                f"❗ Это действие нельзя отменить!",
-                reply_markup=reply_markup,
-                parse_mode='Markdown'
-            )
-            
-            return EDIT_EVENT
-            
-        except Exception as e:
-            logger.error(f"Ошибка при удалении события: {e}")
-            await query.edit_message_text("❌ Ошибка при удалении события.")
-            return EDIT_EVENT
+            logger.error(f"Ошибка публикации сообщения для события {event_data.get('ID', 'unknown')}: {e}")
+            logger.exception("Полная трассировка ошибки:")
     
-    async def _confirm_delete_event(self, update: Update, context: ContextTypes.DEFAULT_TYPE, event_id: str):
-        """Подтверждение удаления события"""
-        query = update.callback_query
-        
-        try:
-            # Получаем все строки из таблицы
-            rows = self.worksheet.get_all_records()
-            
-            if not rows:
-                await query.edit_message_text("❌ Таблица пуста.")
-                return EDIT_EVENT
-            
-            # Ищем строку с нужным ID
-            row_index = None
-            
-            for i, row in enumerate(rows):
-                row_id = row.get('ID') or row.get('id') or row.get('Id')
-                if row_id and str(row_id).strip() == str(event_id).strip():
-                    row_index = i + 2  # +2 because sheets are 1-indexed and first row is header
-                    break
-            
-            if row_index is None:
-                await query.edit_message_text("❌ Событие не найдено для удаления.")
-                return EDIT_EVENT
-            
-            # Удаляем строку
-            self.worksheet.delete_rows(row_index)
-            logger.info(f"Событие {event_id} успешно удалено из Google Sheets")
-            
-            # Удаляем запланированные задачи для этого события
-            try:
-                jobs_to_remove = [job for job in self.scheduler.get_jobs() if job.id.startswith(f"event_{event_id}_")]
-                for job in jobs_to_remove:
-                    job.remove()
-                logger.info(f"Удалены запланированные задачи для события {event_id}")
-            except Exception as e:
-                logger.warning(f"Ошибка при удалении задач для события {event_id}: {e}")
-            
-            await query.edit_message_text(
-                "✅ **Событие успешно удалено!**\n\n"
-                "Возвращаемся к списку событий..."
-            )
-            
-            # Небольшая задержка и переход к просмотру событий
-            import asyncio
-            await asyncio.sleep(1)
-            
-            # Создаем фиктивный update для возврата к списку
-            from unittest.mock import MagicMock
-            mock_message = MagicMock()
-            mock_message.text = "📋 Просмотр событий"
-            mock_message.reply_text = query.message.reply_text
-            
-            mock_update = MagicMock()
-            mock_update.message = mock_message
-            mock_update.effective_user = update.effective_user
-            
-            return await self.view_events(mock_update, context)
-            
-        except Exception as e:
-            logger.error(f"Ошибка при подтверждении удаления события: {e}")
-            await query.edit_message_text("❌ Ошибка при удалении события.")
-            return EDIT_EVENT
-
-    def _create_test_event_data(self, chat_id, name, period_type, period_value, start_date, end_date, time, text, forever):
-        """Вспомогательный метод для создания тестовых данных события"""
-        from datetime import datetime
-        
-        # Создаем временные данные пользователя для тестирования
-        test_user_id = 999999  # Тестовый ID пользователя
-        
-        self.user_data[test_user_id] = {
-            'selected_group': chat_id,
-            'event_name': name,
-            'period_type': period_type,
-            'period_value': period_value,
-            'start_date': datetime.strptime(start_date, '%Y-%m-%d'),
-            'end_date': datetime.strptime(end_date, '%Y-%m-%d') if end_date else None,
-            'time': datetime.strptime(time, '%H:%M'),
-            'text': text,
-            'forever': forever
-        }
-        
-        return test_user_id
-
-    async def run(self):
-        """Запуск бота"""
-        logger.info("Инициализация Google Sheets началась")
-        self._init_google_sheets()
-        logger.info("Google Sheets успешно инициализирован")
-
-        from telegram.ext import Application, CommandHandler, MessageHandler, filters
-        from telegram import BotCommand
-
-        logger.info("Создание приложения Telegram началось")
-        application = Application.builder().token(self.token).build()
-        logger.info("Приложение Telegram успешно создано")
-
-        # Планируем существующие активные события сразу после создания приложения
-        logger.info("Планирование существующих событий...")
-        try:
-            rows = self.worksheet.get_all_records()
-            active_events = [row for row in rows if row.get('Status') == 'active']
-            logger.info(f"Найдено {len(active_events)} активных событий")
-            
-            for event in active_events:
-                try:
-                    await self._schedule_event_jobs(event)
-                    logger.info(f"Запланировано событие: {event['ID']} - {event.get('Description', 'N/A')}")
-                except Exception as e:
-                    logger.error(f"Ошибка планирования события {event['ID']}: {e}")
-                    
-        except Exception as e:
-            logger.error(f"Ошибка при планировании существующих событий: {e}")
-
-        logger.info("Добавление обработчиков началось")
-        application.add_handler(self.create_conversation_handler())
-        application.add_handler(CommandHandler('help', self.help_command))
-        application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, self.handle_group_message))
-        logger.info("Обработчики успешно добавлены")
-
-        logger.info("Установка команд бота началась")
-        commands = [
-            BotCommand("start", "Запуск бота"),
-            BotCommand("help", "Справка"),
-            BotCommand("cancel", "Отмена текущего действия")
-        ]
-        await application.bot.set_my_commands(commands)
-        logger.info("Команды бота успешно установлены")
-
-        logger.info("🚀 Бот запускается...")
-        
-    async def _update_event_period(self, event_id: str, period_type: str, period_value):
-        """Обновление периодичности события в Google Sheets"""
-        try:
-            # Получаем все записи
-            rows = self.worksheet.get_all_records()
-            
-            # Находим строку для обновления
-            for i, row in enumerate(rows):
-                if str(row.get('ID', '')).strip() == str(event_id).strip():
-                    # Обновляем периодичность (строки в Google Sheets индексируются с 1, плюс 1 для заголовка)
-                    row_num = i + 2
-                    
-                    # Обновляем столбцы периодичности
-                    self.worksheet.update_cell(row_num, 8, period_type)  # PeriodType
-                    if period_value is not None:
-                        self.worksheet.update_cell(row_num, 9, str(period_value))  # PeriodValue
-                    else:
-                        self.worksheet.update_cell(row_num, 9, '')
-                    
-                    # Перепланируем задачи для этого события
-                    await self._reschedule_event_jobs(event_id)
-                    
-                    logger.info(f"Обновлена периодичность события {event_id}: {period_type}, {period_value}")
-                    return True
-                    
-            logger.error(f"Событие с ID {event_id} не найдено для обновления")
-            return False
-            
-        except Exception as e:
-            logger.error(f"Ошибка при обновлении периодичности события {event_id}: {e}")
-            return False
+    def _publish_message_sync(self, event_data: Dict):
+        """Синхронная обёртка для публикации сообщения"""
+        asyncio.create_task(self._publish_message_async(event_data))
     
     async def _reschedule_event_jobs(self, event_id: str):
-        """Перепланирование задач для события"""
+        """Перепланирование задач события после изменения"""
         try:
-            # Удаляем старые задачи
-            jobs_to_remove = [job for job in self.scheduler.get_jobs() if job.id.startswith(f"event_{event_id}_")]
-            for job in jobs_to_remove:
-                job.remove()
+            # Удаляем старые задачи для этого события
+            if hasattr(self, 'scheduler'):
+                jobs_to_remove = []
+                for job in self.scheduler.get_jobs():
+                    # Проверяем и старый, и новый формат job_id
+                    if job.id.startswith(f"event_{event_id}_"):
+                        jobs_to_remove.append(job.id)
+                
+                logger.info(f"🗑️ Удаляем {len(jobs_to_remove)} старых задач для события {event_id}")
+                for job_id in jobs_to_remove:
+                    self.scheduler.remove_job(job_id)
+                    logger.info(f"   - Удалена задача: {job_id}")
             
             # Получаем обновленные данные события
             rows = self.worksheet.get_all_records()
@@ -2150,132 +2944,322 @@ class TelegramBot:
             
             if event_data:
                 # Планируем новые задачи
+                logger.info(f"📅 Планируем новые задачи для события {event_id}")
                 await self._schedule_event_jobs(event_data)
-                logger.info(f"Перепланированы задачи для события {event_id}")
+                logger.info(f"✅ Задачи для события {event_id} перепланированы")
             else:
-                logger.error(f"Не найдены данные события {event_id} для перепланирования")
-                
+                logger.warning(f"⚠️ Событие {event_id} не найдено для перепланирования")
+            
         except Exception as e:
-            logger.error(f"Ошибка при перепланировании задач для события {event_id}: {e}")
+            logger.error(f"Ошибка перепланирования задач для события {event_id}: {e}")
     
-    async def _show_event_edit_menu_inline(self, update: Update, context: ContextTypes.DEFAULT_TYPE, event_id: str):
-        """Показ меню редактирования события через inline клавиатуру"""
-        # Получаем данные события
+    async def _update_event_period(self, event_id: str, period_type: str, period_value):
+        """Обновление периодичности события"""
         try:
-            rows = self.worksheet.get_all_records()
+            all_values = self.worksheet.get_all_values()
+            for i, row in enumerate(all_values[1:], start=2):  # Начинаем с 2, так как 1 - заголовки
+                if row[0] == event_id:  # ID в первой колонке
+                    self.worksheet.update_cell(i, 8, period_type)  # Колонка PeriodType (8-я)
+                    period_value_str = json.dumps(period_value) if period_value else ''
+                    self.worksheet.update_cell(i, 9, period_value_str)  # Колонка PeriodValue (9-я)
+                    break
+            
+            # Перепланируем задачи
+            await self._reschedule_event_jobs(event_id)
+            
         except Exception as e:
-            logger.error(f"Ошибка при получении данных из Google Sheets: {e}")
-            await update.message.reply_text("❌ Ошибка при получении данных из Google Sheets.")
-            return EDIT_EVENT
+            logger.error(f"Ошибка обновления периодичности события {event_id}: {e}")
+            raise
+    
+    async def _init_existing_topics_for_chat(self, chat_id: int, bot):
+        """Инициализирует существующие топики для форума"""
+        try:
+            chat = await bot.get_chat(chat_id)
+            chat_title = chat.title or f"Чат {chat_id}"
+            
+            logger.info(f"🔍 Проверяем чат '{chat_title}' на наличие форума")
+            
+            # Проверяем, является ли чат форумом
+            if not (hasattr(chat, 'is_forum') and chat.is_forum):
+                logger.info(f"⚠️ Чат '{chat_title}' не является форумом")
+                return
+                
+            logger.info(f"📌 Начинаем инициализацию топиков для форума '{chat_title}'")
+            
+            # Сохраняем информацию о чате
+            await self._save_chat_name_to_sheets(chat_id, chat_title)
+            
+            # Примечание: В Telegram Bot API нет прямого способа получить список всех топиков форума
+            # Топики будут добавляться автоматически при их создании или изменении
+            logger.info(f"✅ Чат '{chat_title}' готов к отслеживанию топиков")
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка инициализации топиков для чата {chat_id}: {e}")
 
-        event_data = None
-        for row in rows:
-            if str(row.get('ID', '')).strip() == str(event_id).strip():
-                event_data = row
-                break
+    async def _init_all_known_chats(self, bot):
+        """Инициализирует топики для всех известных чатов из Google Sheets"""
+        try:
+            logger.info("🔄 Инициализация топиков для всех известных чатов из Google Sheets")
+            
+            # Получаем все чаты из Google Sheets
+            all_chats = self._get_all_chats_from_sheets()
+            logger.info(f"📊 Найдено {len(all_chats)} чатов в Google Sheets")
+            
+            for chat_id in all_chats:
+                try:
+                    await self._init_existing_topics_for_chat(chat_id, bot)
+                except Exception as e:
+                    logger.warning(f"⚠️ Не удалось инициализировать топики для чата {chat_id}: {e}")
+                    
+            logger.info("✅ Инициализация топиков завершена")
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка при инициализации всех чатов: {e}")
 
-        if not event_data:
-            await update.message.reply_text("❌ Событие не найдено.")
-            return EDIT_EVENT
+    async def _load_and_schedule_existing_events(self):
+        """Загружает и планирует существующие события из Google Sheets"""
+        try:
+            logger.info("🔄 Загрузка существующих событий из Google Sheets")
+            
+            if not hasattr(self, 'worksheet') or self.worksheet is None:
+                logger.error("❌ Worksheet не инициализирован")
+                return
+            
+            # Получаем все записи из Google Sheets
+            records = self.worksheet.get_all_records()
+            logger.info(f"📊 Получено {len(records)} записей из Google Sheets")
+            
+            active_events = []
+            for record in records:
+                status = record.get('Status', '').lower()
+                if status == 'active':
+                    active_events.append(record)
+            
+            logger.info(f"📅 Найдено {len(active_events)} активных событий")
+            
+            # Планируем каждое активное событие
+            scheduled_count = 0
+            events_by_time = {}
+            
+            # Группируем события по времени выполнения для предотвращения коллизий
+            for event in active_events:
+                try:
+                    start_date = datetime.strptime(event['StartDate'], '%Y-%m-%d').date()
+                    time_obj = datetime.strptime(event['Time'], '%H:%M').time()
+                    
+                    # Вычисляем время следующей публикации
+                    now = datetime.now()
+                    if event['PeriodType'] == 'once':
+                        next_datetime = datetime.combine(start_date, time_obj)
+                    else:
+                        # Для повторяющихся событий берем завтрашний день, если дата уже прошла
+                        next_date = start_date
+                        while next_date <= now.date():
+                            next_date += timedelta(days=1)
+                        next_datetime = datetime.combine(next_date, time_obj)
+                    
+                    # Группируем по времени (округляем до минуты)
+                    time_key = next_datetime.replace(second=0, microsecond=0)
+                    if time_key not in events_by_time:
+                        events_by_time[time_key] = []
+                    events_by_time[time_key].append(event)
+                    
+                except Exception as e:
+                    logger.error(f"❌ Ошибка анализа времени события {event.get('ID', 'Unknown')}: {e}")
+            
+            # Планируем события с небольшими задержками для одновременных публикаций
+            for time_key, events_at_time in events_by_time.items():
+                for idx, event in enumerate(events_at_time):
+                    try:
+                        event_id = event.get('ID', 'Unknown')
+                        event_desc = event.get('Description', 'Без названия')
+                        logger.info(f"🔄 Планирование события: {event_id} - {event_desc}")
+                        
+                        # Добавляем небольшую задержку (2 секунды) для событий, которые должны выполняться одновременно
+                        if idx > 0:
+                            delay_seconds = idx * 2
+                            logger.info(f"⏱️ Добавляем задержку {delay_seconds} сек для события {event_id} во избежание конфликтов")
+                            # Временно изменяем время события для планирования
+                            original_time = event['Time']
+                            delayed_time_obj = (datetime.strptime(original_time, '%H:%M') + timedelta(seconds=delay_seconds)).time()
+                            event['Time'] = delayed_time_obj.strftime('%H:%M')
+                        
+                        # Проверяем запланированные задачи перед добавлением
+                        if hasattr(self, 'scheduler'):
+                            existing_jobs = [job.id for job in self.scheduler.get_jobs() if job.id.startswith(f"event_{event_id}")]
+                            if existing_jobs:
+                                logger.info(f"⚠️ Найдены существующие задачи для события {event_id}: {existing_jobs}")
+                        
+                        await self._schedule_event_jobs(event)
+                        
+                        # Восстанавливаем оригинальное время
+                        if idx > 0:
+                            event['Time'] = original_time
+                        
+                        # Проверяем запланированные задачи после добавления
+                        if hasattr(self, 'scheduler'):
+                            new_jobs = [job.id for job in self.scheduler.get_jobs() if job.id.startswith(f"event_{event_id}")]
+                            logger.info(f"📝 Задачи для события {event_id}: {new_jobs}")
+                        
+                        scheduled_count += 1
+                    except Exception as e:
+                        logger.error(f"❌ Ошибка планирования события {event.get('ID', 'Unknown')}: {e}")
+                        logger.exception("Полная трассировка ошибки планирования:")
+            
+            # Выводим общую статистику запланированных задач
+            if hasattr(self, 'scheduler'):
+                all_jobs = self.scheduler.get_jobs()
+                event_jobs = [job for job in all_jobs if job.id.startswith("event_")]
+                logger.info(f"📊 Общее количество запланированных задач событий: {len(event_jobs)}")
+                for job in event_jobs:
+                    logger.info(f"   - {job.id}: {job.next_run_time}")
+            
+            logger.info(f"✅ Загружено и запланировано {scheduled_count} из {len(active_events)} активных событий")
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка загрузки событий: {e}")
+            logger.error(f"❌ Ошибка загрузки событий: {e}")
 
-        # Формируем информацию о событии
-        period_desc = self._get_period_description(event_data)
-        text = str(event_data.get('Text', ''))
+    def run(self):
+        """Основной метод запуска бота"""
+        try:
+            logger.info("Запуск Telegram бота...")
+            
+            # Инициализируем планировщик независимо от Google Sheets
+            if not hasattr(self, 'scheduler') or self.scheduler is None:
+                from apscheduler.schedulers.asyncio import AsyncIOScheduler
+                from apscheduler.executors.asyncio import AsyncIOExecutor
+                
+                # Настраиваем executor для обработки задач
+                executors = {
+                    'default': AsyncIOExecutor()
+                }
+                
+                job_defaults = {
+                    'coalesce': False,  # Не объединять пропущенные задачи
+                    'max_instances': 3,  # Максимум 3 экземпляра одной задачи одновременно
+                    'misfire_grace_time': 30  # Выполнять пропущенные задачи в течение 30 секунд
+                }
+                
+                self.scheduler = AsyncIOScheduler(
+                    executors=executors,
+                    job_defaults=job_defaults
+                )
+                self.scheduler.start()
+                logger.info("APScheduler инициализирован и запущен с улучшенными настройками")
+            
+            # Пытаемся инициализировать Google Sheets
+            sheets_available = self._init_google_sheets()
+            
+            # Создаем приложение
+            self.application = Application.builder().token(self.token).build()
+            
+            # Добавляем обработчики
+            conv_handler = self.create_conversation_handler()
+            self.application.add_handler(conv_handler)
+            
+            # Добавляем обработчик для сообщений в группах (вне диалогов)
+            group_handler = MessageHandler(
+                filters.ALL & ~filters.COMMAND & ~filters.UpdateType.EDITED_MESSAGE,
+                self.handle_group_message
+            )
+            self.application.add_handler(group_handler)
+            
+            # Добавляем обработчики событий форума
+            forum_handlers = [
+                MessageHandler(filters.StatusUpdate.FORUM_TOPIC_CREATED, self.handle_forum_topic_created),
+                MessageHandler(filters.StatusUpdate.FORUM_TOPIC_EDITED, self.handle_forum_topic_edited),
+                MessageHandler(filters.StatusUpdate.FORUM_TOPIC_CLOSED, self.handle_forum_topic_closed),
+                MessageHandler(filters.StatusUpdate.FORUM_TOPIC_REOPENED, self.handle_forum_topic_reopened),
+                MessageHandler(filters.StatusUpdate.GENERAL_FORUM_TOPIC_HIDDEN, self.handle_general_forum_topic_hidden),
+                MessageHandler(filters.StatusUpdate.GENERAL_FORUM_TOPIC_UNHIDDEN, self.handle_general_forum_topic_unhidden),
+            ]
+            
+            for handler in forum_handlers:
+                self.application.add_handler(handler)
+            
+            # Команды
+            self.application.add_handler(CommandHandler("help", self.help_command))
+            self.application.add_handler(CommandHandler("start_bot", self.start_bot_command))
+            self.application.add_handler(CommandHandler("init_topics", self.init_topics_command))
+            
+            # Добавляем обработчик ошибок
+            async def error_handler(update, context):
+                """Обработчик ошибок приложения"""
+                logger.error(f"Произошла ошибка: {context.error}")
+                if "Conflict" in str(context.error):
+                    logger.error("⚠️ Обнаружен конфликт - возможно запущен другой экземпляр бота")
+                    return
+                logger.exception("Полная трассировка ошибки:")
+            
+            self.application.add_error_handler(error_handler)
+            
+            # Добавляем задачу для установки команд и загрузки событий
+            async def post_init(application):
+                # Устанавливаем команды бота
+                #commands = [
+                    #BotCommand("start", "Начать работу с ботом"),
+                    #BotCommand("help", "Показать справку"),
+                    #BotCommand("cancel", "Отменить текущее действие"),
+                    #BotCommand("start_bot", "Справка и запуск бота в группе"),
+                    #BotCommand("init_topics", "Инициализировать топики форума")
+                #]
+                #await application.bot.set_my_commands(commands)
+                
+                # Загружаем и планируем существующие события только если Google Sheets доступен
+                if sheets_available:
+                    await self._load_and_schedule_existing_events()
+                    # Инициализируем топики для всех известных чатов
+                    await self._init_all_known_chats(application.bot)
+                else:
+                    logger.warning("Google Sheets недоступен - работаем в ограниченном режиме")
+                
+                logger.info("Бот успешно запущен и готов к работе!")
+            
+            self.application.post_init = post_init
+            
+            # Запускаем polling (блокирующий вызов)
+            try:
+                self.application.run_polling(
+                    allowed_updates=["message", "callback_query", "forum_topic_created", "forum_topic_edited", "forum_topic_closed", "forum_topic_reopened"],
+                    drop_pending_updates=True
+                )
+            except Exception as polling_error:
+                if "Conflict" in str(polling_error):
+                    logger.error("❌ Конфликт: обнаружен другой запущенный экземпляр бота")
+                    logger.error("Убедитесь, что запущен только один экземпляр бота")
+                else:
+                    logger.error(f"Ошибка polling: {polling_error}")
+                raise
+            
+        except KeyboardInterrupt:
+            logger.info("Получен сигнал завершения")
+        except Exception as e:
+            logger.error(f"Ошибка запуска бота: {e}")
+        finally:
+            # Останавливаем планировщик при завершении
+            if hasattr(self, 'scheduler') and self.scheduler:
+                self.scheduler.shutdown()
+                logger.info("Планировщик остановлен")
 
-        event_info = (
-            f"📝 **Событие: {event_data['Description']}**\n\n"
-            f"🆔 ID: `{event_data.get('ID', 'N/A')}`\n"
-            f"🔄 Период: {period_desc}\n"
-            f"📅 Начало: {event_data.get('StartDate', 'N/A')}\n"
-            f"📅 Окончание: {event_data.get('EndDate', 'Вечно')}\n"
-            f"🕐 Время: {event_data.get('Time', 'N/A')}\n"
-            f"📊 Статус: {event_data.get('Status', 'N/A')}\n\n"
-            f"📄 **Текст:**\n{text[:200]}{'...' if len(text) > 200 else ''}"
-        )
-        
-        keyboard = [
-            [InlineKeyboardButton("✏️ Название", callback_data=f"edit_field_name_{event_id}")],
-            [InlineKeyboardButton("📅 Даты", callback_data=f"edit_field_dates_{event_id}")],
-            [InlineKeyboardButton("🕐 Время", callback_data=f"edit_field_time_{event_id}")],
-            [InlineKeyboardButton("📝 Текст", callback_data=f"edit_field_text_{event_id}")],
-            [InlineKeyboardButton("🔄 Периодичность", callback_data=f"edit_field_period_{event_id}")],
-            [InlineKeyboardButton("🗑️ Удалить", callback_data=f"delete_{event_id}")],
-            [InlineKeyboardButton("🔙 Назад", callback_data="back_to_events")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        # Убираем клавиатуру выбора периодичности
-        hide_keyboard = ReplyKeyboardRemove()
-        
-        await update.message.reply_text(
-            event_info, 
-            reply_markup=reply_markup, 
-            parse_mode='Markdown'
-        )
-        await update.message.reply_text(
-            "Выберите действие:",
-            reply_markup=hide_keyboard
-        )
-        
-        return EDIT_EVENT
-
-        await application.run_polling(drop_pending_updates=True)
-
-
-async def main():
-    """Главная функция для запуска бота"""
+# Точка входа для запуска бота
+def main():
+    """Основная функция"""
     try:
         bot = TelegramBot()
-        # If running inside an environment with a running event loop (e.g., Jupyter/IDE),
-        # we need to manually control PTB Application lifecycle to avoid 'Cannot close a running event loop'.
-        from telegram.ext import Application
-        import asyncio
-        try:
-            asyncio.get_running_loop()
-            # Event loop is already running: manual PTB startup
-            bot._init_google_sheets()
-            application = Application.builder().token(bot.token).build()
-            application.add_handler(bot.create_conversation_handler())
-            application.add_handler(CommandHandler('help', bot.help_command))
-            application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, bot.handle_group_message))
-            commands = [
-                BotCommand("start", "Запуск бота"),
-                BotCommand("help", "Справка"),
-                BotCommand("cancel", "Отмена текущего действия")
-            ]
-            await application.bot.set_my_commands(commands)
-            await application.initialize()
-            await application.start()
-            await application.updater.start_polling(drop_pending_updates=True)
-            # Keep running until interrupted
-            import signal
-            stop_event = asyncio.Event()
-            def _stop(*_):
-                stop_event.set()
-            signal.signal(signal.SIGINT, _stop)
-            signal.signal(signal.SIGTERM, _stop)
-            await stop_event.wait()
-            await application.updater.stop()
-            await application.stop()
-            await application.shutdown()
-        except RuntimeError:
-            # No running event loop: normal PTB run
-            await bot.run()
+        bot.run()
+    except KeyboardInterrupt:
+        logger.info("Получен сигнал завершения")
+    except Exception as e:
+        logger.error(f"Критическая ошибка: {e}")
+        raise
+
+if __name__ == "__main__":
+    try:
+        main()
     except KeyboardInterrupt:
         logger.info("Бот остановлен пользователем")
     except Exception as e:
-        logger.error(f"Критическая ошибка: {e}")
-
-if __name__ == "__main__":
-    import asyncio
-    try:
-        asyncio.get_running_loop()
-        # Если event loop уже запущен (например, Jupyter/IDE)
-        import nest_asyncio
-        nest_asyncio.apply()
-        loop = asyncio.get_event_loop()
-        task = loop.create_task(main())
-        # Don't call run_until_complete, just let the task run
-    except RuntimeError:
-        # Нет активного event loop — обычный запуск
-        asyncio.run(main())
+        logger.error(f"Критическая ошибка при запуске: {e}")
+    finally:
+        logger.info("Бот завершил работу")
